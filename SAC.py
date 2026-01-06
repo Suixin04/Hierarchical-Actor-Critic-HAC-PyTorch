@@ -319,6 +319,8 @@ class SAC:
             done = torch.FloatTensor(done).reshape(-1, 1).to(device)
             
             # ===== Critic Update =====
+            # 注意: 当使用共享深度编码器时，Q1 和 Q2 的 loss 需要合并后一起 backward
+            # 避免编码器被多次更新导致梯度不一致
             with torch.no_grad():
                 next_action, next_log_prob = self.actor.sample(next_state, goal)
                 q_next = torch.min(
@@ -327,16 +329,15 @@ class SAC:
                 ) - self.alpha * next_log_prob
                 target_q = reward + (1 - done) * gamma * q_next
             
-            # Q1
+            # 合并 Q1 和 Q2 的 loss，一起 backward
             q1_loss = F.mse_loss(self.q1(state, action, goal), target_q)
-            self.q1_optimizer.zero_grad()
-            q1_loss.backward()
-            self.q1_optimizer.step()
-            
-            # Q2
             q2_loss = F.mse_loss(self.q2(state, action, goal), target_q)
+            critic_loss = q1_loss + q2_loss
+            
+            self.q1_optimizer.zero_grad()
             self.q2_optimizer.zero_grad()
-            q2_loss.backward()
+            critic_loss.backward()
+            self.q1_optimizer.step()
             self.q2_optimizer.step()
             
             # ===== Actor Update =====

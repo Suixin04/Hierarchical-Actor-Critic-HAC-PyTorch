@@ -62,12 +62,12 @@ class Navigation2DSimpleConfig(BaseConfig):
         self.goal_threshold = np.array([0.8, 0.8])
         
         # ==================== HAC 算法参数 ====================
-        self.k_level = 3
-        self.H = 20
+        self.k_level = 4
+        self.H = 10
         self.lamda = 0.3
         
         # ==================== 学习参数 ====================
-        self.gamma = 0.98
+        self.gamma = 0.99
         self.lr = 0.001
         self.n_iter = 100
         self.batch_size = 128
@@ -157,7 +157,7 @@ class Navigation2DObstacleConfig(BaseConfig):
         self.lamda = 0.3
         
         # ==================== 学习参数 ====================
-        self.gamma = 0.98
+        self.gamma = 0.99
         self.lr = 0.001
         self.n_iter = 100
         self.batch_size = 128
