@@ -1,35 +1,117 @@
+"""
+工具函数和类
+"""
 import numpy as np
+from typing import Tuple, List
+from collections import deque
+
 
 class ReplayBuffer:
-    def __init__(self, max_size=5e5):
-        self.buffer = []
-        self.max_size = int(max_size)
-        self.size = 0
+    """经验回放缓冲区"""
     
-    def add(self, transition):
+    def __init__(self, max_size: int = 500000):
+        """
+        Args:
+            max_size: 最大容量
+        """
+        self.buffer = deque(maxlen=max_size)
+    
+    def add(self, transition: Tuple):
+        """
+        添加一条转换记录
+        
+        Args:
+            transition: (state, action, reward, next_state, goal, gamma, done)
+        """
         assert len(transition) == 7, "transition must have length = 7"
-        
-        # transiton is tuple of (state, action, reward, next_state, goal, gamma, done)
         self.buffer.append(transition)
-        self.size +=1
     
-    def sample(self, batch_size):
-        # delete 1/5th of the buffer when full
-        if self.size > self.max_size:
-            del self.buffer[0:int(self.size/5)]
-            self.size = len(self.buffer)
+    def sample(self, batch_size: int) -> Tuple[np.ndarray, ...]:
+        """
+        随机采样一批数据
         
-        indexes = np.random.randint(0, len(self.buffer), size=batch_size)
-        states, actions, rewards, next_states, goals, gamma, dones = [], [], [], [], [], [], []
+        Args:
+            batch_size: 批大小
+            
+        Returns:
+            states, actions, rewards, next_states, goals, gammas, dones
+        """
+        indices = np.random.randint(0, len(self.buffer), size=batch_size)
         
-        for i in indexes:
-            states.append(np.array(self.buffer[i][0], copy=False))
-            actions.append(np.array(self.buffer[i][1], copy=False))
-            rewards.append(np.array(self.buffer[i][2], copy=False))
-            next_states.append(np.array(self.buffer[i][3], copy=False))
-            goals.append(np.array(self.buffer[i][4], copy=False))
-            gamma.append(np.array(self.buffer[i][5], copy=False))
-            dones.append(np.array(self.buffer[i][6], copy=False))
+        states = []
+        actions = []
+        rewards = []
+        next_states = []
+        goals = []
+        gammas = []
+        dones = []
         
-        return np.array(states), np.array(actions), np.array(rewards), np.array(next_states), np.array(goals),  np.array(gamma), np.array(dones)
+        for i in indices:
+            s, a, r, ns, g, gam, d = self.buffer[i]
+            states.append(np.asarray(s))
+            actions.append(np.asarray(a))
+            rewards.append(np.asarray(r))
+            next_states.append(np.asarray(ns))
+            goals.append(np.asarray(g))
+            gammas.append(np.asarray(gam))
+            dones.append(np.asarray(d))
+        
+        return (
+            np.array(states),
+            np.array(actions),
+            np.array(rewards),
+            np.array(next_states),
+            np.array(goals),
+            np.array(gammas),
+            np.array(dones)
+        )
     
+    def __len__(self) -> int:
+        return len(self.buffer)
+    
+    def clear(self):
+        """清空缓冲区"""
+        self.buffer.clear()
+
+
+class Logger:
+    """简单的训练日志记录器"""
+    
+    def __init__(self, log_file: str = "log.txt"):
+        self.log_file = log_file
+        self.episode_rewards = []
+        self.episode_steps = []
+        self.file = None
+    
+    def start(self):
+        """开始记录"""
+        self.file = open(self.log_file, 'w')
+        self.file.write("episode,reward,steps\n")
+    
+    def log(self, episode: int, reward: float, steps: int):
+        """记录一个episode"""
+        self.episode_rewards.append(reward)
+        self.episode_steps.append(steps)
+        
+        if self.file:
+            self.file.write(f"{episode},{reward},{steps}\n")
+            self.file.flush()
+    
+    def close(self):
+        """关闭日志文件"""
+        if self.file:
+            self.file.close()
+            self.file = None
+    
+    def get_stats(self, last_n: int = 100) -> dict:
+        """获取最近n个episode的统计信息"""
+        recent_rewards = self.episode_rewards[-last_n:]
+        recent_steps = self.episode_steps[-last_n:]
+        
+        return {
+            'mean_reward': np.mean(recent_rewards) if recent_rewards else 0,
+            'std_reward': np.std(recent_rewards) if recent_rewards else 0,
+            'mean_steps': np.mean(recent_steps) if recent_steps else 0,
+            'max_reward': np.max(recent_rewards) if recent_rewards else 0,
+            'min_reward': np.min(recent_rewards) if recent_rewards else 0,
+        }

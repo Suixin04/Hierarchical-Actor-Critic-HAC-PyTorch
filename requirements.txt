@@ -1,4 +1,4 @@
-gym
+gymnasium
 torch
-pyglet
-six
+numpy
+pygame
