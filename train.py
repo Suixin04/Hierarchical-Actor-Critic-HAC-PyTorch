@@ -46,7 +46,7 @@ def parse_args():
                         help='Random seed')
     
     # E2E 预热参数
-    parser.add_argument('--e2e_episodes', type=int, default=100,
+    parser.add_argument('--e2e_episodes', type=int, default=1000,
                         help='Number of episodes for E2E warmup phase')
     parser.add_argument('--e2e_freq', type=int, default=3,
                         help='E2E update frequency (every N episodes)')

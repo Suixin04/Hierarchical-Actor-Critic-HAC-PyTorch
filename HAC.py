@@ -114,6 +114,10 @@ class HAC:
         # Encoder 微调学习率 (RL 阶段 Level 1)
         self.encoder_finetune_lr = getattr(config, 'encoder_finetune_lr', None)  # None = 不微调
         
+        # 动力学阻尼参数 (与环境一致) - 必须在 _build_hierarchy 之前
+        self.damping_v = getattr(config, 'damping_v', 0.95)
+        self.damping_omega = getattr(config, 'damping_omega', 0.9)
+        
         # 构建层级策略网络
         self._build_hierarchy(config.lr)
         
@@ -129,6 +133,7 @@ class HAC:
         print(f"HAC initialized:")
         print(f"  High-level (Level 1+): SAC")
         print(f"  Low-level (Level 0): MPC (horizon={self.mpc_horizon})")
+        print(f"  Dynamics: damping_v={self.damping_v}, damping_omega={self.damping_omega}")
         if self.use_depth_encoder:
             print(f"  Depth Encoder: {self.depth_dim}D → {self.embedding_dim}D")
     
@@ -154,6 +159,8 @@ class HAC:
             max_omega=self.max_omega,
             max_a_v=self.max_a_v,
             max_a_omega=self.max_a_omega,
+            damping_v=self.damping_v,
+            damping_omega=self.damping_omega,
             num_iterations=self.mpc_iterations,
             lr=self.mpc_lr,
             Q=Q, R=R, Qf=Qf,

@@ -32,12 +32,12 @@ class DifferentiableDynamics(nn.Module):
     State: [x, y, θ, v, ω]
     Action: [a_v, a_ω]
     
-    离散化 (Euler):
-        x_{t+1} = x_t + v_t * cos(θ_t) * dt
-        y_{t+1} = y_t + v_t * sin(θ_t) * dt
-        θ_{t+1} = θ_t + ω_t * dt
-        v_{t+1} = v_t + a_v * dt
-        ω_{t+1} = ω_t + a_ω * dt
+    离散化 (带阻尼，与环境一致):
+        v_{t+1} = damping_v * v_t + a_v * dt
+        ω_{t+1} = damping_ω * ω_t + a_ω * dt
+        θ_{t+1} = θ_t + ω_{t+1} * dt
+        x_{t+1} = x_t + v_{t+1} * cos(θ_{t+1}) * dt
+        y_{t+1} = y_t + v_{t+1} * sin(θ_{t+1}) * dt
     """
     
     def __init__(
@@ -45,11 +45,15 @@ class DifferentiableDynamics(nn.Module):
         dt: float = 0.1,
         max_v: float = 2.0,
         max_omega: float = 2.0,
+        damping_v: float = 0.95,      # 与环境一致的阻尼
+        damping_omega: float = 0.9,   # 与环境一致的阻尼
     ):
         super().__init__()
         self.dt = dt
         self.max_v = max_v
         self.max_omega = max_omega
+        self.damping_v = damping_v
+        self.damping_omega = damping_omega
     
     def _soft_clamp(self, x: torch.Tensor, min_val: float, max_val: float, scale: float = 10.0) -> torch.Tensor:
         """
@@ -72,7 +76,7 @@ class DifferentiableDynamics(nn.Module):
         soft_constraints: bool = False
     ) -> torch.Tensor:
         """
-        单步动力学前向传播
+        单步动力学前向传播 (带阻尼，与环境一致)
         
         Args:
             state: [batch, 5] - [x, y, θ, v, ω]
@@ -91,25 +95,25 @@ class DifferentiableDynamics(nn.Module):
         a_v = action[:, 0]
         a_omega = action[:, 1]
         
-        # Euler 积分
-        x_new = x + v * torch.cos(theta) * self.dt
-        y_new = y + v * torch.sin(theta) * self.dt
-        theta_new = theta + omega * self.dt
-        v_new = v + a_v * self.dt
-        omega_new = omega + a_omega * self.dt
-        
-        # 角度归一化到 [-π, π]
-        theta_new = torch.atan2(torch.sin(theta_new), torch.cos(theta_new))
+        # 带阻尼的速度更新 (与环境一致)
+        v_new = self.damping_v * v + a_v * self.dt
+        omega_new = self.damping_omega * omega + a_omega * self.dt
         
         # 速度约束
         if soft_constraints:
-            # 软约束 (可微)
             v_new = self._soft_clamp(v_new, -self.max_v, self.max_v)
             omega_new = self._soft_clamp(omega_new, -self.max_omega, self.max_omega)
         else:
-            # 硬约束 (用于推理)
             v_new = torch.clamp(v_new, -self.max_v, self.max_v)
             omega_new = torch.clamp(omega_new, -self.max_omega, self.max_omega)
+        
+        # 更新朝向 (先更新theta，再用新theta计算位置)
+        theta_new = theta + omega_new * self.dt
+        theta_new = torch.atan2(torch.sin(theta_new), torch.cos(theta_new))
+        
+        # 更新位置 (使用新的速度和朝向)
+        x_new = x + v_new * torch.cos(theta_new) * self.dt
+        y_new = y + v_new * torch.sin(theta_new) * self.dt
         
         next_state = torch.stack([x_new, y_new, theta_new, v_new, omega_new], dim=1)
         return next_state
@@ -288,6 +292,8 @@ class DifferentiableMPC(nn.Module):
         max_omega: float = 2.0,
         max_a_v: float = 1.0,
         max_a_omega: float = 2.0,
+        damping_v: float = 0.95,          # 与环境一致的阻尼
+        damping_omega: float = 0.9,       # 与环境一致的阻尼
         num_iterations: int = 5,        # MPC 内部优化迭代次数
         lr: float = 0.5,                 # MPC 优化学习率
         Q: torch.Tensor = None,
@@ -304,9 +310,10 @@ class DifferentiableMPC(nn.Module):
         self.lr = lr
         self.early_stop_tol = early_stop_tol
         
-        # 动力学模型
+        # 动力学模型 (带阻尼，与环境一致)
         self.dynamics = DifferentiableDynamics(
-            dt=dt, max_v=max_v, max_omega=max_omega
+            dt=dt, max_v=max_v, max_omega=max_omega,
+            damping_v=damping_v, damping_omega=damping_omega
         )
         
         # 代价函数 (纯轨迹追踪)
@@ -530,6 +537,8 @@ class MPCWrapper:
         max_omega: float = 2.0,
         max_a_v: float = 1.0,
         max_a_omega: float = 2.0,
+        damping_v: float = 0.95,          # 与环境一致的阻尼
+        damping_omega: float = 0.9,       # 与环境一致的阻尼
         num_iterations: int = 5,
         lr: float = 0.5,
         Q: torch.Tensor = None,
@@ -543,6 +552,8 @@ class MPCWrapper:
             goal_dim: 目标维度 (2: [x, y])
             horizon: MPC 预测步长
             dt: 时间步长
+            damping_v: 线速度阻尼系数 (与环境一致)
+            damping_omega: 角速度阻尼系数 (与环境一致)
             num_iterations: MPC 优化迭代次数
             lr: MPC 优化学习率
             Q, R, Qf: 代价函数权重 (轨迹追踪)
@@ -558,6 +569,8 @@ class MPCWrapper:
             max_omega=max_omega,
             max_a_v=max_a_v,
             max_a_omega=max_a_omega,
+            damping_v=damping_v,
+            damping_omega=damping_omega,
             num_iterations=num_iterations,
             lr=lr,
             Q=Q,

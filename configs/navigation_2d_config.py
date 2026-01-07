@@ -32,13 +32,13 @@ class Navigation2DObstacleConfig(BaseConfig):
         self.max_a_omega = 2.0
         self.depth_rays = 16
         self.depth_max_range = 5.0
-        self.num_obstacles = 5
+        self.num_obstacles = 6
         
         # ==================== 深度编码器配置 ====================
         self.use_depth_encoder = True      # 是否使用深度编码器
         self.base_state_dim = 5            # 基础状态维度 [x,y,θ,v,ω]
         self.depth_dim = self.depth_rays   # 深度维度
-        self.embedding_dim = 4             # 嵌入维度 (4D 足够表征障碍物方向+距离)
+        self.embedding_dim = 8             # 嵌入维度 (增加到8维以更好表征障碍物)
         # 编码器训练模式由 HAC 自动设置:
         # - Level 1: 'e2e' 模式 (encoder 由特权学习更新，学习避障)
         # - Level 2+: 'rl' 模式 (encoder 由 RL 更新，学习高层规划)
@@ -81,12 +81,16 @@ class Navigation2DObstacleConfig(BaseConfig):
         self.goal_threshold = np.array([0.5, 0.5])  # 子目标达成阈值
         
         # ==================== HAC 算法参数 ====================
-        self.k_level = 4                  # 4 level hierarchy
-        self.H = 7                       # time horizon per level
+        self.k_level = 4                  # 2 level hierarchy
+        self.H = 8                       # time horizon per level
         self.lamda = 0.3
         
         # ==================== MPC 参数 (用于 HybridHAC) ====================
         self.dt = 0.1                    # 时间步长 (与环境一致)
+        
+        # 动力学阻尼参数 (必须与环境一致!)
+        self.damping_v = 0.95            # 线速度阻尼 (环境: 0.95)
+        self.damping_omega = 0.9         # 角速度阻尼 (环境: 0.9)
         
         # ==================== 学习参数 ====================
         self.gamma = 0.99
@@ -103,8 +107,8 @@ class Navigation2DObstacleConfig(BaseConfig):
         
         # ==================== MPC 参数 ====================
         # 注意：MPC 只负责轨迹追踪，避障由 HAC 高层学习实现
-        self.mpc_horizon = 7              # MPC 预测步长
-        self.mpc_iterations = 5            # MPC 优化迭代次数
+        self.mpc_horizon = 8              # MPC 预测步长
+        self.mpc_iterations = 20            # MPC 优化迭代次数
         self.mpc_lr = 0.5                  # MPC 优化学习率
         self.mpc_Q = [10.0, 10.0]          # 位置误差权重
         self.mpc_R = [0.1, 0.1]            # 控制代价权重
