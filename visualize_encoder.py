@@ -41,7 +41,7 @@ def load_encoder(model_dir: str, level: int, config) -> DepthEncoder:
         depth_max_range=config.depth_max_range
     ).to(device)
     
-    encoder_path = os.path.join(model_dir, f'HAC_{config.env_name}_level_{level}_encoder.pth')
+    encoder_path = os.path.join(model_dir, f'HAC_{config.env_name}_best_level_{level}_encoder.pth')
     if os.path.exists(encoder_path):
         encoder.load_state_dict(torch.load(encoder_path, map_location=device, weights_only=True))
         print(f"Loaded encoder from {encoder_path}")
@@ -73,21 +73,42 @@ def collect_samples(env, config, num_samples=2000):
 
 
 def compute_depth_features(depth_samples: np.ndarray, config) -> dict:
-    """计算各种深度特征"""
+    """
+    计算各种深度特征
+    
+    注意: 射线布局为 360° FOV，相对机身坐标系
+    - index 0: 左前方 (-90°)
+    - index n_rays//4: 正前方 (0°)
+    - index n_rays//2: 右前方 (+90°) -> 左后方 (-90° 对面)
+    - index 3*n_rays//4: 正后方 (±180°)
+    """
     n_rays = depth_samples.shape[1]
-    mid = n_rays // 2
+    
+    # 计算各方向的索引
+    front_idx = n_rays // 4  # 正前方
+    right_start = n_rays // 4
+    right_end = n_rays // 2
+    back_idx = 3 * n_rays // 4  # 正后方
+    left_start = 0
+    left_end = n_rays // 4
     
     features = {
         'min_depth': depth_samples.min(axis=1),
         'max_depth': depth_samples.max(axis=1),
         'mean_depth': depth_samples.mean(axis=1),
         'std_depth': depth_samples.std(axis=1),
-        'front_depth': depth_samples[:, mid-1:mid+2].mean(axis=1),  # 前方
-        'left_depth': depth_samples[:, :n_rays//4].mean(axis=1),     # 左侧
-        'right_depth': depth_samples[:, -n_rays//4:].mean(axis=1),   # 右侧
-        'back_depth': depth_samples[:, n_rays//2-2:n_rays//2+3].mean(axis=1) if n_rays > 8 else depth_samples.mean(axis=1),
-        'left_right_diff': depth_samples[:, :n_rays//4].mean(axis=1) - depth_samples[:, -n_rays//4:].mean(axis=1),
-        'danger_level': 1.0 / (depth_samples.min(axis=1) + 0.1),  # 危险程度
+        # 前方: 索引 n_rays//4 附近 (正前方±15°)
+        'front_depth': depth_samples[:, front_idx-1:front_idx+2].mean(axis=1),
+        # 左侧: 索引 0 ~ n_rays//4 (左前 90°)
+        'left_depth': depth_samples[:, left_start:left_end].mean(axis=1),
+        # 右侧: 索引 n_rays//4 ~ n_rays//2 (右前 90°)
+        'right_depth': depth_samples[:, right_start:right_end].mean(axis=1),
+        # 后方: 索引 3*n_rays//4 附近
+        'back_depth': depth_samples[:, back_idx-1:back_idx+2].mean(axis=1) if n_rays > 8 else depth_samples.mean(axis=1),
+        # 左右差异
+        'left_right_diff': depth_samples[:, left_start:left_end].mean(axis=1) - depth_samples[:, right_start:right_end].mean(axis=1),
+        # 危险程度
+        'danger_level': 1.0 / (depth_samples.min(axis=1) + 0.1),
     }
     return features
 
@@ -204,10 +225,13 @@ def plot_jacobian_analysis(encoder: DepthEncoder, depth_samples: np.ndarray,
     axes[0].set_yticks(range(embed_dim))
     axes[0].set_yticklabels([f'Dim {i}' for i in range(embed_dim)])
     
-    # 添加方向标签
+    # 添加方向标签 (相对机身坐标系: 0=左前, n/4=前, n/2=右前, 3n/4=后)
     direction_labels = []
     for i in range(depth_dim):
-        angle = (i / depth_dim - 0.5) * 360
+        # 从 -90° 到 +270° (相对机身前方)
+        angle = (i / depth_dim - 0.25) * 360
+        if angle > 180:
+            angle -= 360  # 转换为 -180° ~ +180°
         direction_labels.append(f'{int(angle)}°')
     axes[0].set_xticklabels(direction_labels, rotation=45, fontsize=8)
     
@@ -226,7 +250,14 @@ def plot_jacobian_analysis(encoder: DepthEncoder, depth_samples: np.ndarray,
     axes[1].set_ylabel('Sensitivity |∂z/∂d|')
     axes[1].set_title('Sensitivity by Embedding Dimension')
     axes[1].set_xticks(x)
-    axes[1].set_xticklabels(direction_labels, rotation=45, fontsize=8)
+    # 方向标签与上图一致
+    bar_direction_labels = []
+    for i in range(depth_dim):
+        angle = (i / depth_dim - 0.25) * 360
+        if angle > 180:
+            angle -= 360
+        bar_direction_labels.append(f'{int(angle)}°')
+    axes[1].set_xticklabels(bar_direction_labels, rotation=45, fontsize=8)
     axes[1].legend(loc='upper right')
     axes[1].grid(axis='y', alpha=0.3)
     
@@ -338,7 +369,7 @@ def plot_embedding_distributions(embeddings: np.ndarray, features: dict,
         
         # 下行: 箱线图
         data = [embeddings[safe_mask, i], embeddings[medium_mask, i], embeddings[danger_mask, i]]
-        bp = axes[1, i].boxplot(data, labels=['Safe', 'Medium', 'Danger'], patch_artist=True)
+        bp = axes[1, i].boxplot(data, tick_labels=['Safe', 'Medium', 'Danger'], patch_artist=True)
         for patch, color in zip(bp['boxes'], ['green', 'orange', 'red']):
             patch.set_facecolor(color)
             patch.set_alpha(0.5)
@@ -355,7 +386,9 @@ def plot_embedding_distributions(embeddings: np.ndarray, features: dict,
 def plot_depth_reconstruction(encoder: DepthEncoder, depth_samples: np.ndarray,
                               save_path: str, level: int, num_examples=8):
     """可视化原始深度 vs 编码后的表示"""
-    fig, axes = plt.subplots(num_examples, 2, figsize=(12, 2*num_examples))
+    # 使用 GridSpec 创建混合布局
+    fig = plt.figure(figsize=(12, 2.5*num_examples))
+    gs = GridSpec(num_examples, 2, figure=fig)
     
     indices = np.random.choice(len(depth_samples), num_examples, replace=False)
     
@@ -367,26 +400,26 @@ def plot_depth_reconstruction(encoder: DepthEncoder, depth_samples: np.ndarray,
             depth_tensor = torch.FloatTensor(depth).unsqueeze(0).to(device)
             embedding = encoder(depth_tensor).cpu().numpy().flatten()
         
-        # 绘制深度雷达图
+        # 绘制深度雷达图 (极坐标)
         n_rays = len(depth)
-        angles = np.linspace(-np.pi, np.pi, n_rays, endpoint=False)
+        # 射线从 -90° 到 +270° (相对机身前方)
+        angles = np.linspace(-np.pi/2, 3*np.pi/2, n_rays, endpoint=False)
         
-        # 深度极坐标图
-        ax_polar = fig.add_subplot(num_examples, 2, 2*i+1, projection='polar')
+        ax_polar = fig.add_subplot(gs[i, 0], projection='polar')
         ax_polar.plot(angles, depth, 'b-', linewidth=2)
         ax_polar.fill(angles, depth, alpha=0.3)
         ax_polar.set_ylim(0, depth.max() * 1.1)
-        ax_polar.set_title(f'Sample {idx}: Depth Profile', fontsize=10)
+        ax_polar.set_theta_zero_location('N')  # 0° 在上方 (前方)
+        ax_polar.set_theta_direction(-1)  # 顺时针
+        ax_polar.set_title(f'Sample {idx}: Depth Profile (min={depth.min():.2f})', fontsize=10)
         
         # Embedding 条形图
-        axes[i, 1].bar(range(len(embedding)), embedding, color='steelblue')
-        axes[i, 1].set_xlabel('Embedding Dimension')
-        axes[i, 1].set_ylabel('Value')
-        axes[i, 1].set_title(f'Embedding (min_d={depth.min():.2f})', fontsize=10)
-        axes[i, 1].set_xticks(range(len(embedding)))
-        
-        # 移除原来的空白子图
-        axes[i, 0].axis('off')
+        ax_bar = fig.add_subplot(gs[i, 1])
+        ax_bar.bar(range(len(embedding)), embedding, color='steelblue')
+        ax_bar.set_xlabel('Embedding Dimension')
+        ax_bar.set_ylabel('Value')
+        ax_bar.set_title(f'Embedding', fontsize=10)
+        ax_bar.set_xticks(range(len(embedding)))
     
     plt.suptitle(f'Level {level} Encoder: Depth → Embedding Examples', fontsize=14)
     plt.tight_layout()

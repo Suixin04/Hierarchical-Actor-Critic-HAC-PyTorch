@@ -354,12 +354,12 @@ class Navigation2DEnv(gym.Env):
         # 更新朝向
         self.agent_theta = normalize_angle(self.agent_theta + self.agent_omega * self.dt)
         
-        # 更新位置
+        # 计算新位置
         new_x = self.agent_pos[0] + self.agent_v * np.cos(self.agent_theta) * self.dt
         new_y = self.agent_pos[1] + self.agent_v * np.sin(self.agent_theta) * self.dt
         new_pos = np.array([new_x, new_y])
         
-        # 检测墙壁碰撞 (碰撞时速度归零，但不终止)
+        # 检测墙壁碰撞 (碰撞时速度归零，位置不更新)
         wall_collision = (
             new_pos[0] - self.agent_radius < 0 or
             new_pos[0] + self.agent_radius > self.world_size or
@@ -367,23 +367,29 @@ class Navigation2DEnv(gym.Env):
             new_pos[1] + self.agent_radius > self.world_size
         )
         
-        if wall_collision:
-            # 碰墙时速度减半并反弹
+        # 检测障碍物碰撞 (在更新位置前检测)
+        obstacle_collision = False
+        for ox, oy, orad in self.obstacles:
+            dist = np.sqrt((new_pos[0] - ox)**2 + (new_pos[1] - oy)**2)
+            if dist < self.agent_radius + orad:
+                obstacle_collision = True
+                break
+        
+        # 只有在不碰撞时才更新位置
+        if not wall_collision and not obstacle_collision:
+            self.agent_pos = new_pos
+        else:
+            # 碰撞时速度反向并衰减
             self.agent_v *= -0.3
-        
-        # 裁剪位置 (不能出界)
-        self.agent_pos = np.clip(
-            new_pos,
-            self.agent_radius,
-            self.world_size - self.agent_radius
-        )
-        
-        # 检测障碍物碰撞
-        obstacle_collision = self._check_obstacle_collision()
-        
-        if obstacle_collision:
-            # 碰到障碍物速度也减半
-            self.agent_v *= -0.3
+            self.agent_omega *= 0.5
+            
+            # 如果是墙壁碰撞，裁剪位置到边界内
+            if wall_collision:
+                self.agent_pos = np.clip(
+                    self.agent_pos,
+                    self.agent_radius + 0.01,
+                    self.world_size - self.agent_radius - 0.01
+                )
         
         collision = wall_collision or obstacle_collision
         

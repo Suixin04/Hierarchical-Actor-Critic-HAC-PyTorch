@@ -7,12 +7,23 @@ HAC 分阶段训练脚本 (清理版)
     python train.py --render                            # 开启渲染
     
 训练阶段:
-    Phase 1 (E2E预热): 只用E2E更新编码器，RL更新策略(编码器输出detach)
-    Phase 2 (RL微调):  编码器固定，RL正常更新策略
+    Phase 1 (E2E预热): 
+      - Level 1: E2E 更新 Encoder (特权学习避障), RL 更新 Actor (encoder detach)
+      - Level 2+: RL 更新 Encoder + Actor (高层规划)
+    Phase 2 (RL微调):  
+      - Level 1: Encoder 冻结, RL 更新 Actor
+      - Level 2+: RL 继续更新 Encoder + Actor
     
-梯度流保证:
-    - Phase 1: Encoder ← E2E only, Policy ← RL (encoder detached)
-    - Phase 2: Encoder ❄️ frozen, Policy ← RL
+梯度流设计:
+    - Level 1 Encoder ← E2E only (通过特权学习学会避障表征)
+    - Level 2+ Encoder ← RL (学习高层规划所需的深度表征)
+
+架构改进:
+    - Level 1: 使用 MPC 预测可达性 (替代传统 Subgoal Testing)
+      * MPC 直接预测 H 步后能到达的位置
+      * 如果预测不可达，立即惩罚，无需实际执行
+      * 预测的最终位置可用于 Hindsight Action
+    - Level 2+: 保留传统 Subgoal Testing 机制
 """
 import argparse
 import torch
@@ -115,18 +126,15 @@ def train(args):
     if args.seed:
         config.random_seed = args.seed
     
-    # 强制设置 encoder_train_mode='e2e' (Phase 1 需要 RL detach encoder)
-    config.encoder_train_mode = 'e2e'
-    
     print("=" * 60)
     print("  HAC STAGED TRAINING")
     print("=" * 60)
     print(f"  Phase 1 (E2E Warmup): Episodes 1-{args.e2e_episodes}")
-    print(f"    - Encoder: Updated by E2E only")
-    print(f"    - Policy: Updated by RL (encoder detached)")
+    print(f"    - Level 1 Encoder: E2E (特权学习避障)")
+    print(f"    - Level 2+ Encoder: RL (高层规划)")
     print(f"  Phase 2 (RL Finetune): Episodes {args.e2e_episodes+1}-{config.max_episodes}")
-    print(f"    - Encoder: Frozen")
-    print(f"    - Policy: Updated by RL")
+    print(f"    - Level 1 Encoder: Frozen")
+    print(f"    - Level 2+ Encoder: RL (继续更新)")
     print("=" * 60)
     print(config)
     print("=" * 60)

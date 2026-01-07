@@ -159,9 +159,12 @@ class MPCCost(nn.Module):
         Q: torch.Tensor = None,           # 位置误差权重 [2]
         R: torch.Tensor = None,           # 控制代价权重 [2]
         Qf: torch.Tensor = None,          # 终端代价权重 [2]
-        obstacle_weight: float = 10.0,    # 避障权重
-        safe_distance: float = 0.5,       # 安全距离
     ):
+        """
+        纯轨迹追踪代价函数 (无避障)
+        
+        避障由上层 HAC 负责
+        """
         super().__init__()
         
         # 默认权重
@@ -175,8 +178,6 @@ class MPCCost(nn.Module):
         self.register_buffer('Q', Q)
         self.register_buffer('R', R)
         self.register_buffer('Qf', Qf)
-        self.obstacle_weight = obstacle_weight
-        self.safe_distance = safe_distance
     
     def position_cost(
         self, 
@@ -224,62 +225,26 @@ class MPCCost(nn.Module):
         cost = (actions ** 2 * self.R).sum(dim=2)
         return cost
     
-    def obstacle_cost(
-        self, 
-        states: torch.Tensor, 
-        obstacles: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        软约束避障代价 (可微)
-        
-        cost = Σ_obs weight * ReLU(safe_dist - dist)²
-        
-        Args:
-            states: [batch, horizon+1, 5]
-            obstacles: [num_obs, 3] - [x, y, radius]
-            
-        Returns:
-            cost: [batch, horizon+1]
-        """
-        if obstacles is None or len(obstacles) == 0:
-            return torch.zeros(states.shape[0], states.shape[1], device=states.device)
-        
-        pos = states[:, :, :2]  # [batch, horizon+1, 2]
-        batch_size, horizon_plus_1, _ = pos.shape
-        num_obs = obstacles.shape[0]
-        
-        # 展开计算
-        pos_expanded = pos.unsqueeze(2)  # [batch, horizon+1, 1, 2]
-        obs_pos = obstacles[:, :2].unsqueeze(0).unsqueeze(0)  # [1, 1, num_obs, 2]
-        obs_radius = obstacles[:, 2].unsqueeze(0).unsqueeze(0)  # [1, 1, num_obs]
-        
-        # 计算距离
-        dist = torch.norm(pos_expanded - obs_pos, dim=3)  # [batch, horizon+1, num_obs]
-        
-        # 软约束: ReLU(safe_dist + radius - dist)²
-        margin = self.safe_distance + obs_radius - dist
-        violation = F.relu(margin) ** 2  # [batch, horizon+1, num_obs]
-        
-        # 对所有障碍物求和
-        cost = self.obstacle_weight * violation.sum(dim=2)  # [batch, horizon+1]
-        
-        return cost
+    # 注意: 避障逻辑已移除
+    # MPC 现在是纯轨迹追踪控制器
+    # 避障由上层 HAC 通过深度传感器学习实现
     
     def forward(
         self,
         states: torch.Tensor,
         actions: torch.Tensor,
         goal: torch.Tensor,
-        obstacles: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
-        计算总代价
+        计算总代价 (纯轨迹追踪，无避障)
+        
+        避障由上层 HAC 负责：HAC 通过深度传感器学习输出安全的子目标
+        MPC 只需追踪子目标即可
         
         Args:
             states: [batch, horizon+1, 5] 状态轨迹
             actions: [batch, horizon, 2] 控制序列
-            goal: [batch, 2] 目标位置
-            obstacles: [num_obs, 3] 障碍物
+            goal: [batch, 2] 目标位置 (子目标)
             
         Returns:
             total_cost: [batch] 总代价
@@ -295,15 +260,11 @@ class MPCCost(nn.Module):
         terminal_state = states[:, -1, :]  # [batch, 5]
         term_cost = self.position_cost(terminal_state, goal, terminal=True)  # [batch]
         
-        # Obstacle cost
-        obs_cost = self.obstacle_cost(states, obstacles)  # [batch, horizon+1]
-        
-        # 总代价
+        # 总代价 (无避障项)
         total_cost = (
             pos_cost.sum(dim=1) + 
             ctrl_cost.sum(dim=1) + 
-            term_cost + 
-            obs_cost.sum(dim=1)
+            term_cost
         )
         
         return total_cost
@@ -311,11 +272,12 @@ class MPCCost(nn.Module):
 
 class DifferentiableMPC(nn.Module):
     """
-    可微 MPC 控制器
+    可微 MPC 控制器 - 纯轨迹追踪
     
     通过梯度下降优化控制序列，支持梯度回传到目标
     
-    使用迭代 LQR / iLQR 风格的优化，但用 PyTorch 自动求导简化实现
+    注意：MPC 不负责避障，避障由上层 HAC 学习实现
+    HAC 通过深度传感器学习输出安全的子目标，MPC 只追踪子目标
     """
     
     def __init__(
@@ -331,8 +293,6 @@ class DifferentiableMPC(nn.Module):
         Q: torch.Tensor = None,
         R: torch.Tensor = None,
         Qf: torch.Tensor = None,
-        obstacle_weight: float = 10.0,
-        safe_distance: float = 0.5,
         early_stop_tol: float = 1e-3,   # 早停容差
     ):
         super().__init__()
@@ -349,12 +309,8 @@ class DifferentiableMPC(nn.Module):
             dt=dt, max_v=max_v, max_omega=max_omega
         )
         
-        # 代价函数
-        self.cost_fn = MPCCost(
-            Q=Q, R=R, Qf=Qf,
-            obstacle_weight=obstacle_weight,
-            safe_distance=safe_distance
-        )
+        # 代价函数 (纯轨迹追踪)
+        self.cost_fn = MPCCost(Q=Q, R=R, Qf=Qf)
         
         # 暖启动：保存上一次的解
         self.prev_actions = None
@@ -402,19 +358,16 @@ class DifferentiableMPC(nn.Module):
         self,
         state: torch.Tensor,
         goal: torch.Tensor,
-        obstacles: Optional[torch.Tensor] = None,
         return_trajectory: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
         """
-        求解 MPC 并返回最优动作
+        求解 MPC 并返回最优动作 (纯轨迹追踪，无避障)
         
-        这是一个纯优化过程，不需要对输入求梯度。
-        (端到端训练使用 get_action_with_gradient 方法)
+        避障由上层 HAC 负责，MPC 只追踪给定的子目标
         
         Args:
             state: [batch, state_dim] 当前状态 (可能含深度，只用前5维)
-            goal: [batch, 2] 子目标位置
-            obstacles: [num_obs, 3] 障碍物 [x, y, radius]
+            goal: [batch, 2] 子目标位置 (由 HAC 给出的安全子目标)
             return_trajectory: 是否返回预测轨迹
             
         Returns:
@@ -449,8 +402,8 @@ class DifferentiableMPC(nn.Module):
             clipped_actions = self._clip_actions(actions)
             states = self.dynamics.rollout(base_state, clipped_actions)
             
-            # 计算代价
-            cost = self.cost_fn(states, clipped_actions, goal_detached, obstacles)
+            # 计算代价 (无避障项)
+            cost = self.cost_fn(states, clipped_actions, goal_detached)
             total_cost = cost.sum()
             
             # 早停检查: 如果代价变化很小，提前退出
@@ -472,7 +425,7 @@ class DifferentiableMPC(nn.Module):
         final_actions = actions_data.detach()
         with torch.no_grad():
             final_states = self.dynamics.rollout(base_state, final_actions)
-            final_cost = self.cost_fn(final_states, final_actions, goal_detached, obstacles)
+            final_cost = self.cost_fn(final_states, final_actions, goal_detached)
         
         # 保存用于暖启动
         self.prev_actions = final_actions.clone()
@@ -492,10 +445,9 @@ class DifferentiableMPC(nn.Module):
         self,
         state: torch.Tensor,
         goal: torch.Tensor,
-        obstacles: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        获取动作，同时保留对 goal 的梯度
+        获取动作，同时保留对 goal 的梯度 (纯轨迹追踪)
         
         这是端到端训练的关键函数！
         
@@ -503,17 +455,13 @@ class DifferentiableMPC(nn.Module):
         - 将 MPC 的迭代优化展开为计算图
         - 梯度可以通过整个优化过程回传到 goal
         
-        注意: 由于动力学的特性（加速度影响速度，速度影响位置），
-        需要返回多步预测的轨迹才能有效传递梯度。
-        
         Args:
             state: [batch, state_dim]
-            goal: [batch, 2] (应该连接到计算图，或自己有 requires_grad)
-            obstacles: [num_obs, 3]
+            goal: [batch, 2] (应该连接到计算图，由 HAC 输出)
             
         Returns:
             action: [batch, 2] 第一步动作
-            predicted_trajectory: [batch, horizon+1, 5] 预测轨迹 (用于端到端训练)
+            predicted_trajectory: [batch, horizon+1, 5] 预测轨迹
             final_position: [batch, 2] 最终预测位置 (梯度连接到 goal)
         """
         batch_size = state.shape[0]
@@ -534,8 +482,8 @@ class DifferentiableMPC(nn.Module):
             # 展开轨迹
             states = self.dynamics.rollout(base_state, clipped_actions, soft_constraints=True)
             
-            # 计算代价 (goal 在这里参与计算)
-            cost = self.cost_fn(states, clipped_actions, goal, obstacles)
+            # 计算代价 (goal 在这里参与计算，无避障)
+            cost = self.cost_fn(states, clipped_actions, goal)
             
             # 计算梯度
             # create_graph=True 使得 grad 成为 goal 的函数
@@ -562,9 +510,11 @@ class DifferentiableMPC(nn.Module):
 
 class MPCWrapper:
     """
-    MPC 包装器，提供与 DDPG/SAC 相同的接口
+    MPC 包装器 - 纯轨迹追踪控制器
     
-    用于替换 HAC 的底层策略
+    提供与 DDPG/SAC 相同的接口，用于替换 HAC 的底层策略
+    
+    注意：MPC 不负责避障，避障由上层 HAC 通过深度信息学习实现
     """
     
     def __init__(
@@ -585,24 +535,17 @@ class MPCWrapper:
         Q: torch.Tensor = None,
         R: torch.Tensor = None,
         Qf: torch.Tensor = None,
-        obstacle_weight: float = 10.0,
-        safe_distance: float = 0.5,
-        **kwargs
     ):
         """
         Args:
             state_dim: 状态维度 (可能含深度)
             action_dim: 动作维度 (2: [a_v, a_ω])
             goal_dim: 目标维度 (2: [x, y])
-            action_bounds: 动作边界
-            action_offset: 动作偏移
             horizon: MPC 预测步长
             dt: 时间步长
             num_iterations: MPC 优化迭代次数
             lr: MPC 优化学习率
-            Q, R, Qf: 代价函数权重
-            obstacle_weight: 避障权重
-            safe_distance: 安全距离
+            Q, R, Qf: 代价函数权重 (轨迹追踪)
         """
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -620,24 +563,14 @@ class MPCWrapper:
             Q=Q,
             R=R,
             Qf=Qf,
-            obstacle_weight=obstacle_weight,
-            safe_distance=safe_distance,
         ).to(device)
-        
-        # 当前障碍物信息 (需要从环境获取)
-        self.obstacles = None
     
     def set_obstacles(self, obstacles: List[Tuple[float, float, float]]):
         """
-        设置障碍物信息
-        
-        Args:
-            obstacles: List of (x, y, radius)
+        兼容接口 - MPC 不再使用障碍物信息
+        避障由上层 HAC 负责
         """
-        if obstacles:
-            self.obstacles = torch.tensor(obstacles, dtype=torch.float32, device=device)
-        else:
-            self.obstacles = None
+        pass  # 不做任何事
     
     def select_action(
         self, 
@@ -650,7 +583,7 @@ class MPCWrapper:
         
         Args:
             state: 状态
-            goal: 子目标 [x, y]
+            goal: 子目标 [x, y] (由 HAC 给出的安全子目标)
             deterministic: MPC 本身是确定性的
             
         Returns:
@@ -659,8 +592,8 @@ class MPCWrapper:
         state_t = torch.FloatTensor(state.reshape(1, -1)).to(device)
         goal_t = torch.FloatTensor(goal.reshape(1, -1)).to(device)
         
-        # 注意: 不用 torch.no_grad()，因为 MPC forward 内部需要计算梯度来优化
-        action, _, _ = self.mpc(state_t, goal_t, self.obstacles)
+        # MPC 只追踪子目标，不管障碍物
+        action, _, _ = self.mpc(state_t, goal_t)
         
         return action.detach().cpu().numpy().flatten()
     
