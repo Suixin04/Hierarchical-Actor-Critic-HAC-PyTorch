@@ -261,8 +261,8 @@ class SAC:
         embedding_dim: int = 8,
         depth_max_range: float = 5.0,
         level: int = 0,
-        # Encoder 训练模式: 'e2e' = RL时detach, 'rl' = RL时更新
-        encoder_train_mode: str = 'e2e',
+        # Encoder 训练模式: 'finetune' = 小学习率微调, 'rl' = 正常更新
+        encoder_train_mode: str = 'finetune',
     ):
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -271,8 +271,8 @@ class SAC:
         self.level = level
         
         # Encoder 训练模式:
-        # - 'e2e': RL 时 detach encoder，encoder 只由 E2E 更新 (Level 1 用)
-        # - 'rl': RL 时更新 encoder (Level 2+ 用)
+        # - 'finetune': RL 时用小学习率更新 encoder (Level 1，预训练后微调)
+        # - 'rl': RL 时正常学习率更新 encoder (Level 2+)
         self.encoder_train_mode = encoder_train_mode
         
         # 创建本层独立的深度编码器
@@ -318,6 +318,30 @@ class SAC:
             self.alpha = self.log_alpha.exp().item()
         else:
             self.alpha = alpha
+        
+        # Encoder 优化器
+        # encoder 不是 Actor/Q 的子模块，需要单独的 optimizer
+        # - 'finetune': 初始化时不创建，等 enable_encoder_finetune 时创建（小学习率）
+        # - 'rl': 直接创建正常学习率的 optimizer
+        self.encoder_finetune_optimizer = None
+        if self.depth_encoder is not None and encoder_train_mode == 'rl':
+            self.encoder_finetune_optimizer = optim.Adam(
+                self.depth_encoder.parameters(), lr=lr
+            )
+            print(f"    Level {level} encoder optimizer created (lr={lr})")
+    
+    def setup_encoder_finetune(self, finetune_lr: float):
+        """
+        设置 encoder 微调优化器 (Phase 2 用)
+        
+        为 encoder 创建独立的优化器，使用更小的学习率
+        """
+        if self.depth_encoder is not None:
+            self.encoder_finetune_optimizer = optim.Adam(
+                self.depth_encoder.parameters(), 
+                lr=finetune_lr
+            )
+            print(f"    Encoder finetune optimizer created (lr={finetune_lr})")
     
     def select_action(self, state, goal, deterministic: bool = False):
         """选择动作"""
@@ -332,12 +356,18 @@ class SAC:
         """
         RL 更新策略
         
-        根据 encoder_train_mode 决定是否更新 encoder:
-        - 'e2e': detach encoder，RL 只更新 Actor/Critic (Level 1)
-        - 'rl': 不 detach，RL 同时更新 Encoder + Actor/Critic (Level 2+)
+        根据 encoder_finetune_optimizer 决定 encoder 更新方式:
+        - 有 optimizer: 不 detach，通过 optimizer 更新 encoder
+        - 无 optimizer: detach，不更新 encoder (由 E2E 更新)
+        
+        Level 1 (finetune 模式):
+          - Phase 1: 无 optimizer，detach encoder，RL 不更新 (E2E 单独更新)
+          - Phase 2: enable_finetune 后有 optimizer，不 detach，用小学习率微调
+        Level 2+ (rl 模式):
+          - 初始化时就有 optimizer，始终不 detach，正常学习率更新
         """
-        # 根据模式决定是否 detach encoder
-        detach_enc = (self.encoder_train_mode == 'e2e')
+        # 只有当有 encoder optimizer 时，才允许梯度流向 encoder
+        detach_enc = (self.encoder_finetune_optimizer is None) and (self.depth_encoder is not None)
         
         for _ in range(n_iter):
             state, action, reward, next_state, goal, gamma, done = buffer.sample(batch_size)
@@ -379,8 +409,16 @@ class SAC:
             actor_loss = (self.alpha * log_prob - q_new).mean()
             
             self.actor_optimizer.zero_grad()
+            # 如果有 encoder 微调优化器，也 zero_grad
+            if self.encoder_finetune_optimizer is not None:
+                self.encoder_finetune_optimizer.zero_grad()
+            
             actor_loss.backward()
             self.actor_optimizer.step()
+            
+            # 如果有 encoder 微调优化器，也 step
+            if self.encoder_finetune_optimizer is not None:
+                self.encoder_finetune_optimizer.step()
             
             # ===== Entropy Coefficient Update =====
             if self.auto_entropy:

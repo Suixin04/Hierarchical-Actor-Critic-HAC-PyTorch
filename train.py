@@ -1,29 +1,25 @@
 """
-HAC 分阶段训练脚本 (清理版)
+HAC 分阶段训练脚本
+
+架构: SAC + HAC + MPC (确定)
 
 用法:
-    python train.py --env Navigation2DObstacle-v1       # 默认分阶段训练
+    python train.py                                     # 默认训练
     python train.py --e2e_episodes 300                  # E2E预热300回合
     python train.py --render                            # 开启渲染
     
 训练阶段:
-    Phase 1 (E2E预热): 
+    Phase 1 (E2E 预热): 
       - Level 1: E2E 更新 Encoder (特权学习避障), RL 更新 Actor (encoder detach)
       - Level 2+: RL 更新 Encoder + Actor (高层规划)
-    Phase 2 (RL微调):  
-      - Level 1: Encoder 冻结, RL 更新 Actor
+      
+    Phase 2 (RL 微调):  
+      - Level 1: Encoder 微调 (小学习率) 或 冻结, RL 更新 Actor
       - Level 2+: RL 继续更新 Encoder + Actor
-    
-梯度流设计:
-    - Level 1 Encoder ← E2E only (通过特权学习学会避障表征)
-    - Level 2+ Encoder ← RL (学习高层规划所需的深度表征)
 
-架构改进:
-    - Level 1: 使用 MPC 预测可达性 (替代传统 Subgoal Testing)
-      * MPC 直接预测 H 步后能到达的位置
-      * 如果预测不可达，立即惩罚，无需实际执行
-      * 预测的最终位置可用于 Hindsight Action
-    - Level 2+: 保留传统 Subgoal Testing 机制
+改进:
+    - Level 1: MPC 预测可达性 (替代传统 Subgoal Testing)
+    - 特权学习: 训练时用精确障碍物位置，测试时只用深度传感器
 """
 import argparse
 import torch
@@ -37,12 +33,9 @@ from HAC import HAC
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='HAC Staged Training')
+    parser = argparse.ArgumentParser(description='HAC Training')
     parser.add_argument('--env', type=str, default='Navigation2DObstacle-v1',
                         help='Environment name')
-    parser.add_argument('--algorithm', type=str, default='sac',
-                        choices=['ddpg', 'sac'],
-                        help='High-level algorithm')
     parser.add_argument('--k_level', type=int, default=None,
                         help='Number of hierarchy levels')
     parser.add_argument('--max_episodes', type=int, default=None,
@@ -69,16 +62,8 @@ def parse_args():
 
 def run_e2e_training(agent, config, batch_size=64, lr=3e-4, num_updates=5):
     """
-    E2E 训练：通过可微 MPC 更新 Encoder + Actor
-    
-    梯度流: TaskLoss → MPC轨迹 → 子目标 → Actor → Encoder
-    
-    Returns:
-        final_dist: 到目标的平均距离 (归一化指标)
+    E2E 训练：通过可微 MPC 更新 Encoder + Actor (特权学习)
     """
-    if not hasattr(agent, 'mpc') or agent.mpc is None:
-        return None
-    
     if agent.k_level < 2:
         return None
     
@@ -89,11 +74,8 @@ def run_e2e_training(agent, config, batch_size=64, lr=3e-4, num_updates=5):
     
     losses = []
     for _ in range(num_updates):
-        if hasattr(buffer, 'sample_states'):
-            states = buffer.sample_states(batch_size)
-        else:
-            batch = buffer.sample(batch_size)
-            states = batch[0]
+        batch = buffer.sample(batch_size)
+        states = batch[0]
         
         try:
             loss_history = agent.train_end_to_end_batch(
@@ -117,8 +99,6 @@ def train(args):
     config = get_config(args.env)
     
     # 命令行覆盖
-    if args.algorithm:
-        config.algorithm = args.algorithm
     if args.k_level:
         config.k_level = args.k_level
     if args.max_episodes:
@@ -127,14 +107,18 @@ def train(args):
         config.random_seed = args.seed
     
     print("=" * 60)
-    print("  HAC STAGED TRAINING")
+    print("  HAC + SAC + MPC 分阶段训练")
     print("=" * 60)
-    print(f"  Phase 1 (E2E Warmup): Episodes 1-{args.e2e_episodes}")
-    print(f"    - Level 1 Encoder: E2E (特权学习避障)")
-    print(f"    - Level 2+ Encoder: RL (高层规划)")
-    print(f"  Phase 2 (RL Finetune): Episodes {args.e2e_episodes+1}-{config.max_episodes}")
-    print(f"    - Level 1 Encoder: Frozen")
-    print(f"    - Level 2+ Encoder: RL (继续更新)")
+    print(f"  Phase 1 (E2E 预热): Episodes 1-{args.e2e_episodes}")
+    print(f"    - Level 1 Encoder: E2E 特权学习")
+    print(f"    - Level 2+ Encoder: RL 更新")
+    print(f"  Phase 2 (RL 微调): Episodes {args.e2e_episodes+1}-{config.max_episodes}")
+    finetune_lr = getattr(config, 'encoder_finetune_lr', None)
+    if finetune_lr:
+        print(f"    - Level 1 Encoder: 微调 (lr={finetune_lr})")
+    else:
+        print(f"    - Level 1 Encoder: 冻结")
+    print(f"    - Level 2+ Encoder: RL 继续更新")
     print("=" * 60)
     print(config)
     print("=" * 60)
@@ -151,8 +135,8 @@ def train(args):
         torch.manual_seed(config.random_seed)
         np.random.seed(config.random_seed)
     
-    # HAC 智能体
-    agent = HAC(config, render=args.render, algorithm=config.algorithm)
+    # HAC 智能体 (架构固定为 SAC)
+    agent = HAC(config, render=args.render)
     
     # 保存目录
     save_dir = config.get_save_directory()
@@ -173,13 +157,15 @@ def train(args):
         # ========== 阶段切换 ==========
         if current_phase == 1 and episode > args.e2e_episodes:
             print("\n" + "=" * 60)
-            print("  PHASE TRANSITION: E2E Warmup -> RL Finetune")
-            print("  Freezing all encoders...")
-            print("=" * 60 + "\n")
+            print("  阶段切换: E2E 预热 -> RL 微调")
+            print("=" * 60)
             
-            agent.freeze_all_encoders()
+            # 为 Level 1 encoder 启用微调或冻结
+            agent.enable_level1_encoder_finetune()
+            
             current_phase = 2
             agent.save(save_dir, config.get_filename() + '_phase1')
+            print("=" * 60 + "\n")
         
         # 运行 episode
         agent.reset_episode()
@@ -198,10 +184,10 @@ def train(args):
         
         # ========== Phase 1: E2E 预热 ==========
         if current_phase == 1:
-            # RL 更新策略 (encoder 输出被 detach，不会被 RL 更新)
+            # RL 更新策略
             agent.update(config.n_iter, config.batch_size)
             
-            # E2E 更新 Encoder + Actor
+            # E2E 更新
             e2e_loss = None
             if episode % args.e2e_freq == 0:
                 e2e_loss = run_e2e_training(
@@ -219,7 +205,6 @@ def train(args):
         
         # ========== Phase 2: RL 微调 ==========
         else:
-            # 纯 RL 更新 (encoder 已冻结)
             agent.update(config.n_iter, config.batch_size)
             phase_str = "[P2-RL]"
             e2e_str = ""
@@ -247,11 +232,11 @@ def train(args):
     env.close()
     
     print("\n" + "=" * 60)
-    print("  Training Completed!")
-    print(f"  Best Reward: {best_reward:.2f}")
-    print(f"  E2E Updates: {len(e2e_losses)}")
+    print("  训练完成!")
+    print(f"  最佳奖励: {best_reward:.2f}")
+    print(f"  E2E 更新次数: {len(e2e_losses)}")
     if e2e_losses:
-        print(f"  Final E2E Dist: {e2e_losses[-1]:.2f}")
+        print(f"  最终 E2E 距离: {e2e_losses[-1]:.2f}")
     print("=" * 60)
 
 

@@ -1,92 +1,10 @@
 """
 Navigation2D 环境配置 - 双轮差速移动机器人
 
-两种环境：
-1. Navigation2DSimple-v1: 无障碍物，用于基础训练
-2. Navigation2DObstacle-v1: 带障碍物，用于避障训练
+环境：Navigation2DObstacle-v1 - 带障碍物的避障导航
 """
 import numpy as np
 from configs.base_config import BaseConfig
-
-
-class Navigation2DSimpleConfig(BaseConfig):
-    """
-    无障碍物的简单导航环境
-    
-    State: [x, y, θ, v, ω]
-    Action: [a_v, a_ω]
-    Goal: [x, y]
-    """
-    
-    def _setup(self):
-        # ==================== 环境基本信息 ====================
-        self.env_name = "Navigation2DSimple-v1"
-        
-        # 环境参数
-        self.world_size = 10.0
-        self.max_v = 2.0
-        self.max_omega = 2.0
-        self.max_a_v = 1.0
-        self.max_a_omega = 2.0
-        
-        # ==================== 状态空间配置 ====================
-        self.state_dim = 5
-        
-        self.state_bounds = np.array([
-            self.world_size / 2, self.world_size / 2,
-            np.pi,
-            self.max_v, self.max_omega,
-        ])
-        self.state_offset = np.array([
-            self.world_size / 2, self.world_size / 2,
-            0.0,
-            0.0, 0.0,
-        ])
-        self.state_clip_low = np.array([
-            0, 0, -np.pi, -self.max_v, -self.max_omega,
-        ])
-        self.state_clip_high = np.array([
-            self.world_size, self.world_size, np.pi, self.max_v, self.max_omega,
-        ])
-        
-        # ==================== 动作空间配置 ====================
-        self.action_dim = 2
-        self.action_bounds = np.array([self.max_a_v, self.max_a_omega])
-        self.action_offset = np.array([0.0, 0.0])
-        self.action_clip_low = np.array([-self.max_a_v, -self.max_a_omega])
-        self.action_clip_high = np.array([self.max_a_v, self.max_a_omega])
-        
-        # ==================== 目标空间配置 ====================
-        self.goal_indices = [0, 1]
-        self.goal_state = np.array([8.5, 8.5])
-        self.goal_threshold = np.array([0.5, 0.5])  # 子目标达成阈值
-        
-        # ==================== HAC 算法参数 ====================
-        self.k_level = 4                  # 4 level hierarchy
-        self.H = 10                       # time horizon per level
-        self.lamda = 0.3
-        
-        # ==================== 学习参数 ====================
-        self.gamma = 0.99
-        self.lr = 0.001
-        self.n_iter = 100
-        self.batch_size = 128
-        self.hidden_dim = 64
-        
-        # ==================== SAC 专用参数 ====================
-        self.sac_alpha = 0.2               # 初始熵系数
-        self.sac_auto_entropy = True       # 自动熵调节
-        self.sac_target_entropy = None     # None = -action_dim = -2
-        self.sac_alpha_lr = None           # None = 使用 lr
-        
-        # ==================== 探索噪声 ====================
-        self.exploration_action_noise = np.array([0.5, 1.0])
-        self.exploration_state_noise = np.array([2.0, 2.0])
-        
-        # ==================== 训练参数 ====================
-        self.max_episodes = 2000
-        self.save_episode = 50
-        self.random_seed = 0
 
 
 class Navigation2DObstacleConfig(BaseConfig):
@@ -203,6 +121,12 @@ class Navigation2DObstacleConfig(BaseConfig):
         self.e2e_obstacle_weight = 10.0   # E2E 训练中避障损失权重
         self.e2e_safe_distance = 0.3      # 子目标到障碍物的安全距离
         self.e2e_traj_safe_distance = 0.2 # 轨迹点到障碍物的安全距离
+        
+        # ==================== Encoder 微调参数 ====================
+        # RL 阶段 (Phase 2) Level 1 encoder 微调学习率
+        # None = 完全冻结 encoder (只用 E2E 训练的表征)
+        # 建议值: lr * 0.1 = 0.0001 (小学习率微调)
+        self.encoder_finetune_lr = 0.0001
         
         # ==================== 探索噪声 ====================
         self.exploration_action_noise = np.array([0.3, 0.6])
