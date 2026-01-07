@@ -437,3 +437,199 @@ class HAC:
         self.prediction_errors = []
         # 重置 MPC 暖启动
         self.mpc.mpc.prev_actions = None
+    
+    # ============== 端到端训练方法 ==============
+    
+    def train_end_to_end(
+        self,
+        state: np.ndarray,
+        final_goal: np.ndarray,
+        num_steps: int = 3,
+        verbose: bool = False
+    ) -> dict:
+        """
+        端到端训练：通过可微 MPC 将梯度从任务损失传回高层策略
+        
+        梯度流: TaskLoss → MPC预测轨迹 → 子目标 → Actor → DepthEncoder
+        
+        关键洞察：由于动力学特性（加速度→速度→位置），需要使用 MPC 的
+        多步预测位置（final_position）来有效传递梯度。
+        
+        Args:
+            state: 初始状态
+            final_goal: 最终目标
+            num_steps: 高层子目标更新次数
+            verbose: 是否打印详情
+            
+        Returns:
+            loss_info: 损失信息字典
+        """
+        if self.k_level < 2:
+            return {'error': 'Need at least 2 levels for E2E training'}
+        
+        # 获取高层策略 (Level 1)
+        high_level_policy = self.HAC[1]  # SAC/DDPG
+        
+        if not hasattr(high_level_policy, 'actor'):
+            return {'error': 'High level policy has no actor'}
+        
+        # 准备优化器 (只优化 Actor 和 Encoder)
+        optimizer = torch.optim.Adam(high_level_policy.actor.parameters(), lr=1e-4)
+        
+        # 转换为 tensor
+        state_t = torch.FloatTensor(state.reshape(1, -1)).to(device)
+        goal_t = torch.FloatTensor(final_goal.reshape(1, -1)).to(device)
+        
+        # 获取障碍物
+        obstacles = self.mpc.obstacles
+        
+        # 保留深度部分
+        if state_t.shape[1] > 5:
+            depth_part = state_t[:, 5:]
+        else:
+            depth_part = None
+        
+        optimizer.zero_grad()
+        
+        # ===== 展开轨迹 =====
+        final_positions = []  # 每个子目标的 MPC 预测最终位置
+        actions = []
+        current_state = state_t.clone()
+        
+        for t in range(num_steps):
+            # 高层策略输出子目标
+            subgoal, _ = high_level_policy.actor.sample(current_state, goal_t)
+            
+            # MPC 追踪子目标 (使用可微版本!)
+            # 返回: action, trajectory, final_position
+            action, trajectory, final_pos = self.mpc.mpc.get_action_with_gradient(
+                current_state, subgoal, obstacles
+            )
+            
+            final_positions.append(final_pos)
+            actions.append(action)
+            
+            # 更新状态到 MPC 预测轨迹的终点
+            next_base = trajectory[:, -1, :5]
+            if depth_part is not None:
+                current_state = torch.cat([next_base, depth_part], dim=1)
+            else:
+                current_state = next_base
+        
+        # ===== 计算任务损失 =====
+        # 1. 到达目标损失 (使用最终位置)
+        final_pos = final_positions[-1]
+        goal_loss = ((final_pos - goal_t) ** 2).sum()
+        
+        # 2. 进度损失 (鼓励每一步都接近目标)
+        progress_loss = torch.tensor(0.0, device=device)
+        for t, fp in enumerate(final_positions):
+            weight = 0.3 * (t + 1) / num_steps
+            progress_loss += weight * ((fp - goal_t) ** 2).sum()
+        
+        # 3. 避障损失
+        obstacle_loss = torch.tensor(0.0, device=device)
+        if obstacles is not None and len(obstacles) > 0:
+            for fp in final_positions:
+                for obs in obstacles:
+                    ox, oy, radius = obs
+                    dist = torch.norm(fp - obs[:2].unsqueeze(0), dim=1)
+                    violation = torch.relu(self.mpc_safe_distance + radius - dist)
+                    obstacle_loss += 5.0 * (violation ** 2).sum()
+        
+        # 4. 控制平滑损失
+        smooth_loss = torch.tensor(0.0, device=device)
+        if len(actions) > 1:
+            for t in range(1, len(actions)):
+                diff = actions[t] - actions[t-1]
+                smooth_loss += 0.1 * (diff ** 2).sum()
+        
+        # 总损失
+        total_loss = goal_loss + progress_loss + obstacle_loss + smooth_loss
+        
+        # ===== 反向传播 =====
+        total_loss.backward()
+        
+        # 检查梯度
+        grad_info = {}
+        if high_level_policy.depth_encoder is not None:
+            encoder_grad_norm = sum(
+                p.grad.norm().item() 
+                for p in high_level_policy.depth_encoder.parameters() 
+                if p.grad is not None
+            )
+            grad_info['encoder_grad_norm'] = encoder_grad_norm
+        
+        actor_grad_norm = sum(
+            p.grad.norm().item() 
+            for p in high_level_policy.actor.parameters() 
+            if p.grad is not None and 'depth_encoder' not in str(p)
+        )
+        grad_info['actor_grad_norm'] = actor_grad_norm
+        
+        # 更新参数
+        optimizer.step()
+        
+        # 返回损失信息
+        loss_info = {
+            'total': total_loss.item(),
+            'goal': goal_loss.item(),
+            'progress': progress_loss.item(),
+            'obstacle': obstacle_loss.item(),
+            'smooth': smooth_loss.item(),
+            'final_dist': torch.norm(final_pos - goal_t).item(),
+            **grad_info
+        }
+        
+        if verbose:
+            print(f"  E2E Loss: {total_loss.item():.4f} "
+                  f"(goal={goal_loss.item():.3f}, "
+                  f"obs={obstacle_loss.item():.3f})")
+            print(f"  Final distance: {loss_info['final_dist']:.3f}")
+            print(f"  Gradients: encoder={grad_info.get('encoder_grad_norm', 0):.4f}, "
+                  f"actor={grad_info.get('actor_grad_norm', 0):.4f}")
+        
+        return loss_info
+    
+    def train_end_to_end_batch(
+        self,
+        states: np.ndarray,
+        final_goal: np.ndarray,
+        num_steps: int = 10,
+        num_epochs: int = 5,
+        verbose: bool = False
+    ) -> List[dict]:
+        """
+        批量端到端训练
+        
+        Args:
+            states: [batch, state_dim] 初始状态批次
+            final_goal: 最终目标
+            num_steps: 每条轨迹的展开步数
+            num_epochs: 训练轮数
+            verbose: 是否打印详情
+            
+        Returns:
+            loss_history: 损失历史
+        """
+        loss_history = []
+        
+        for epoch in range(num_epochs):
+            epoch_losses = []
+            
+            for state in states:
+                loss_info = self.train_end_to_end(
+                    state=state,
+                    final_goal=final_goal,
+                    num_steps=num_steps,
+                    verbose=False
+                )
+                epoch_losses.append(loss_info['total'])
+            
+            avg_loss = np.mean(epoch_losses)
+            loss_history.append({'epoch': epoch, 'avg_loss': avg_loss})
+            
+            if verbose:
+                print(f"E2E Epoch {epoch}: avg_loss = {avg_loss:.4f}")
+        
+        return loss_history

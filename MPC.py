@@ -51,10 +51,25 @@ class DifferentiableDynamics(nn.Module):
         self.max_v = max_v
         self.max_omega = max_omega
     
+    def _soft_clamp(self, x: torch.Tensor, min_val: float, max_val: float, scale: float = 10.0) -> torch.Tensor:
+        """
+        软裁剪函数 (可微)
+        
+        使用 tanh 实现软约束，保持梯度流动
+        """
+        center = (min_val + max_val) / 2
+        half_range = (max_val - min_val) / 2
+        # 映射到 [-1, 1] 再用 tanh 软约束
+        normalized = (x - center) / (half_range + 1e-6)
+        # tanh 会在边界附近软化
+        soft = torch.tanh(normalized / scale) * scale
+        return soft * half_range + center
+    
     def forward(
         self, 
         state: torch.Tensor, 
-        action: torch.Tensor
+        action: torch.Tensor,
+        soft_constraints: bool = False
     ) -> torch.Tensor:
         """
         单步动力学前向传播
@@ -62,6 +77,7 @@ class DifferentiableDynamics(nn.Module):
         Args:
             state: [batch, 5] - [x, y, θ, v, ω]
             action: [batch, 2] - [a_v, a_ω]
+            soft_constraints: 是否使用软约束 (可微训练时使用)
             
         Returns:
             next_state: [batch, 5]
@@ -85,9 +101,15 @@ class DifferentiableDynamics(nn.Module):
         # 角度归一化到 [-π, π]
         theta_new = torch.atan2(torch.sin(theta_new), torch.cos(theta_new))
         
-        # 速度裁剪
-        v_new = torch.clamp(v_new, -self.max_v, self.max_v)
-        omega_new = torch.clamp(omega_new, -self.max_omega, self.max_omega)
+        # 速度约束
+        if soft_constraints:
+            # 软约束 (可微)
+            v_new = self._soft_clamp(v_new, -self.max_v, self.max_v)
+            omega_new = self._soft_clamp(omega_new, -self.max_omega, self.max_omega)
+        else:
+            # 硬约束 (用于推理)
+            v_new = torch.clamp(v_new, -self.max_v, self.max_v)
+            omega_new = torch.clamp(omega_new, -self.max_omega, self.max_omega)
         
         next_state = torch.stack([x_new, y_new, theta_new, v_new, omega_new], dim=1)
         return next_state
@@ -95,7 +117,8 @@ class DifferentiableDynamics(nn.Module):
     def rollout(
         self, 
         init_state: torch.Tensor, 
-        actions: torch.Tensor
+        actions: torch.Tensor,
+        soft_constraints: bool = False
     ) -> torch.Tensor:
         """
         多步轨迹展开
@@ -103,6 +126,7 @@ class DifferentiableDynamics(nn.Module):
         Args:
             init_state: [batch, 5] 初始状态
             actions: [batch, horizon, 2] 控制序列
+            soft_constraints: 是否使用软约束
             
         Returns:
             states: [batch, horizon+1, 5] 状态轨迹 (包含初始状态)
@@ -114,7 +138,7 @@ class DifferentiableDynamics(nn.Module):
         state = init_state
         
         for t in range(horizon):
-            state = self.forward(state, actions[:, t, :])
+            state = self.forward(state, actions[:, t, :], soft_constraints=soft_constraints)
             states.append(state)
         
         return torch.stack(states, dim=1)
@@ -354,10 +378,22 @@ class DifferentiableMPC(nn.Module):
         actions = actions.requires_grad_(True)
         return actions
     
-    def _clip_actions(self, actions: torch.Tensor) -> torch.Tensor:
-        """裁剪动作到约束范围"""
-        a_v = torch.clamp(actions[:, :, 0], -self.max_a_v, self.max_a_v)
-        a_omega = torch.clamp(actions[:, :, 1], -self.max_a_omega, self.max_a_omega)
+    def _clip_actions(self, actions: torch.Tensor, soft: bool = False) -> torch.Tensor:
+        """
+        裁剪动作到约束范围
+        
+        Args:
+            actions: [batch, horizon, 2]
+            soft: 是否使用软裁剪 (可微训练时使用)
+        """
+        if soft:
+            # 使用 tanh 软约束
+            a_v = torch.tanh(actions[:, :, 0] / self.max_a_v) * self.max_a_v
+            a_omega = torch.tanh(actions[:, :, 1] / self.max_a_omega) * self.max_a_omega
+        else:
+            # 硬裁剪
+            a_v = torch.clamp(actions[:, :, 0], -self.max_a_v, self.max_a_v)
+            a_omega = torch.clamp(actions[:, :, 1], -self.max_a_omega, self.max_a_omega)
         return torch.stack([a_v, a_omega], dim=2)
     
     def forward(
@@ -449,60 +485,71 @@ class DifferentiableMPC(nn.Module):
         state: torch.Tensor,
         goal: torch.Tensor,
         obstacles: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         获取动作，同时保留对 goal 的梯度
         
         这是端到端训练的关键函数！
         
-        原理: 使用隐函数定理
-        - MPC 的解 u* 是 goal g 的函数
-        - 通过自动微分计算 ∂u*/∂g
+        原理: 使用展开优化 (Unrolled Optimization)
+        - 将 MPC 的迭代优化展开为计算图
+        - 梯度可以通过整个优化过程回传到 goal
+        
+        注意: 由于动力学的特性（加速度影响速度，速度影响位置），
+        需要返回多步预测的轨迹才能有效传递梯度。
         
         Args:
             state: [batch, state_dim]
-            goal: [batch, 2] (需要 requires_grad=True)
+            goal: [batch, 2] (应该连接到计算图，或自己有 requires_grad)
             obstacles: [num_obs, 3]
             
         Returns:
-            action: [batch, 2] (梯度连接到 goal)
-            predicted_next_state: [batch, 5]
+            action: [batch, 2] 第一步动作
+            predicted_trajectory: [batch, horizon+1, 5] 预测轨迹 (用于端到端训练)
+            final_position: [batch, 2] 最终预测位置 (梯度连接到 goal)
         """
         batch_size = state.shape[0]
-        base_state = state[:, :5]
+        base_state = state[:, :5].detach()  # 状态不需要梯度
         
-        # 固定迭代次数的展开 (unrolled optimization)
-        # 这样梯度可以通过整个优化过程回传
+        # 初始化动作序列
         actions = torch.zeros(
             batch_size, self.horizon, 2, 
-            device=state.device, 
+            device=state.device,
             requires_grad=True
         )
         
-        for _ in range(self.num_iterations):
-            # 前向
-            clipped_actions = self._clip_actions(actions)
-            states = self.dynamics.rollout(base_state, clipped_actions)
+        # 展开优化迭代
+        for iteration in range(self.num_iterations):
+            # 使用软约束裁剪
+            clipped_actions = self._clip_actions(actions, soft=True)
+            
+            # 展开轨迹
+            states = self.dynamics.rollout(base_state, clipped_actions, soft_constraints=True)
+            
+            # 计算代价 (goal 在这里参与计算)
             cost = self.cost_fn(states, clipped_actions, goal, obstacles)
             
             # 计算梯度
+            # create_graph=True 使得 grad 成为 goal 的函数
             grad = torch.autograd.grad(
-                cost.sum(), actions, 
-                create_graph=True,  # 关键: 保留计算图
+                cost.sum(), 
+                actions, 
+                create_graph=True,
                 retain_graph=True
             )[0]
             
             # 梯度下降更新
             actions = actions - self.lr * grad
         
-        # 最终动作
-        final_actions = self._clip_actions(actions)
-        final_states = self.dynamics.rollout(base_state, final_actions)
+        # 最终轨迹 (关键: 这个轨迹依赖于 goal)
+        final_actions = self._clip_actions(actions, soft=True)
+        final_states = self.dynamics.rollout(base_state, final_actions, soft_constraints=True)
         
         first_action = final_actions[:, 0, :]
-        predicted_next_state = final_states[:, 1, :]  # 预测的下一状态
+        # 返回最终位置 (horizon 步后的位置)，这个有到 goal 的梯度
+        final_position = final_states[:, -1, :2]
         
-        return first_action, predicted_next_state
+        return first_action, final_states, final_position
 
 
 class MPCWrapper:

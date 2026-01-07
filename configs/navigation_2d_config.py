@@ -160,7 +160,7 @@ class Navigation2DObstacleConfig(BaseConfig):
         
         # ==================== HAC 算法参数 ====================
         self.k_level = 4                  # 4 level hierarchy
-        self.H = 10                       # time horizon per level
+        self.H = 7                       # time horizon per level
         self.lamda = 0.3
         
         # ==================== MPC 参数 (用于 HybridHAC) ====================
