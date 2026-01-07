@@ -123,13 +123,7 @@ class Navigation2DObstacleConfig(BaseConfig):
         self.embedding_dim = 4             # 嵌入维度 (4D 足够表征障碍物方向+距离)
         # 编码器训练模式: 'rl' = 只RL更新, 'e2e' = 只E2E更新, 'both' = 两者都更新
         self.encoder_train_mode = 'e2e'
-        
-        # ==================== 子目标安全约束配置 ====================
-        self.use_subgoal_safety_constraint = True   # 启用基于深度的子目标硬约束
-        self.subgoal_safe_margin = 0.3              # 安全边距 (距障碍物最小距离)
-        self.subgoal_min_dist = 0.5                 # 子目标最小距离
-        self.depth_fov = 2 * np.pi                  # 深度传感器视场角 (360°)
-        self.safety_penalty_ratio = 0.5             # 安全违规惩罚系数 (penalty = -H * ratio)
+        self.depth_fov = 2 * np.pi         # 深度传感器视场角 (360°)
         
         # ==================== 状态空间配置 ====================
         self.state_dim = 5 + self.depth_rays  # 21维

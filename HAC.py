@@ -9,7 +9,6 @@ Hierarchical Actor-Critic (HAC) + MPC 底层控制
 - 底层使用已知动力学模型，无需学习基础控制
 - 高层专注于学习高级规划策略
 - 支持端到端梯度回传 (第二阶段)
-- 支持基于深度信息的子目标安全约束
 """
 import torch
 import torch.optim as optim
@@ -22,88 +21,6 @@ from utils import ReplayBuffer
 from configs.base_config import BaseConfig
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-
-def project_subgoal_to_safe_region(
-    subgoal: np.ndarray,
-    state: np.ndarray,
-    depth_readings: np.ndarray,
-    depth_fov: float = 2 * np.pi,
-    safe_margin: float = 0.3,
-    min_subgoal_dist: float = 0.5,
-) -> np.ndarray:
-    """
-    将子目标投影到基于深度信息的安全区域内 (硬约束)
-    
-    原理:
-    1. 计算子目标相对于机器人的方向
-    2. 根据深度射线找到该方向的最大安全距离
-    3. 如果子目标超出安全距离，则投影到安全边界
-    
-    Args:
-        subgoal: 子目标位置 [x, y] (世界坐标系)
-        state: 当前状态 [x, y, θ, v, ω, depth_1, ..., depth_n]
-        depth_readings: 深度射线读数 [n_rays]
-        depth_fov: 深度传感器视场角 (默认 2π 全向)
-        safe_margin: 安全边距 (距障碍物的最小距离)
-        min_subgoal_dist: 子目标最小距离 (避免太近)
-        
-    Returns:
-        safe_subgoal: 安全的子目标位置 [x, y]
-        
-    适用场景:
-    - 2D 激光雷达/深度传感器
-    - 3D 深度相机 (取对应方向的最小深度)
-    """
-    robot_pos = state[:2]  # [x, y]
-    robot_theta = state[2]  # 朝向角
-    
-    # 计算子目标相对于机器人的向量
-    delta = subgoal - robot_pos
-    dist_to_subgoal = np.linalg.norm(delta)
-    
-    if dist_to_subgoal < 1e-6:
-        # 子目标与当前位置重合，返回原点偏移
-        return robot_pos + np.array([min_subgoal_dist, 0])
-    
-    # 计算子目标方向 (世界坐标系)
-    subgoal_angle_world = np.arctan2(delta[1], delta[0])
-    
-    # 转换为机身坐标系的相对角度
-    relative_angle = subgoal_angle_world - robot_theta
-    # 归一化到 [-π, π]
-    while relative_angle > np.pi:
-        relative_angle -= 2 * np.pi
-    while relative_angle < -np.pi:
-        relative_angle += 2 * np.pi
-    
-    # 计算对应的深度射线索引
-    n_rays = len(depth_readings)
-    angle_step = depth_fov / n_rays
-    start_angle = -depth_fov / 2
-    
-    # 相对角度 → 射线索引
-    ray_index = int((relative_angle - start_angle) / angle_step)
-    ray_index = np.clip(ray_index, 0, n_rays - 1)
-    
-    # 获取该方向的安全距离 (考虑相邻射线以增加鲁棒性)
-    indices = [ray_index]
-    if ray_index > 0:
-        indices.append(ray_index - 1)
-    if ray_index < n_rays - 1:
-        indices.append(ray_index + 1)
-    
-    # 取最小深度作为安全距离
-    safe_dist = min(depth_readings[i] for i in indices) - safe_margin
-    safe_dist = max(safe_dist, min_subgoal_dist)  # 确保不小于最小距离
-    
-    # 如果子目标超出安全距离，投影到安全边界
-    if dist_to_subgoal > safe_dist:
-        direction = delta / dist_to_subgoal
-        safe_subgoal = robot_pos + direction * safe_dist
-        return safe_subgoal
-    
-    return subgoal
 
 
 class HAC:
@@ -203,18 +120,6 @@ class HAC:
         # 编码器训练模式: 'e2e' = 只由E2E更新 (RL时detach)
         self.encoder_train_mode = getattr(config, 'encoder_train_mode', 'e2e')
         
-        # ============ 子目标安全约束配置 ============
-        # 是否启用基于深度的子目标硬约束
-        self.use_subgoal_safety_constraint = getattr(config, 'use_subgoal_safety_constraint', True)
-        # 安全边距 (距障碍物的最小距离)
-        self.subgoal_safe_margin = getattr(config, 'subgoal_safe_margin', 0.3)
-        # 子目标最小距离 (避免子目标太近导致频繁切换)
-        self.subgoal_min_dist = getattr(config, 'subgoal_min_dist', 0.5)
-        # 深度传感器视场角 (默认全向)
-        self.depth_fov = getattr(config, 'depth_fov', 2 * np.pi)
-        # 安全违规惩罚系数 (相对于 -H)
-        self.safety_penalty_ratio = getattr(config, 'safety_penalty_ratio', 0.5)
-        
         # 构建层级策略网络
         self._build_hierarchy(config.lr)
         
@@ -227,79 +132,11 @@ class HAC:
         self.reward = 0
         self.timestep = 0
         
-        # 安全约束统计
-        self.safety_stats = {
-            'total_subgoals': 0,
-            'modified_subgoals': 0,
-            'total_modification_dist': 0.0,
-            'safety_violations_penalized': 0,
-        }
-        
         print(f"HAC initialized:")
         print(f"  High-level (Level 1+): {self.algorithm.upper()}")
         print(f"  Low-level (Level 0): MPC (horizon={self.mpc_horizon})")
         if self.use_depth_encoder:
             print(f"  Depth Encoder: {self.depth_dim}D → {self.embedding_dim}D")
-        if self.use_subgoal_safety_constraint:
-            print(f"  Subgoal Safety: ON (margin={self.subgoal_safe_margin}m)")
-    
-    def reset_safety_stats(self):
-        """重置安全统计（每个 episode 开始时调用）"""
-        self.safety_stats = {
-            'total_subgoals': 0,
-            'modified_subgoals': 0,
-            'total_modification_dist': 0.0,
-            'safety_violations_penalized': 0,
-        }
-    
-    def get_safety_stats(self):
-        """获取安全统计摘要"""
-        stats = self.safety_stats
-        total = stats['total_subgoals']
-        modified = stats['modified_subgoals']
-        return {
-            'total': total,
-            'modified': modified,
-            'rate': modified / total if total > 0 else 0,
-            'avg_mod_dist': stats['total_modification_dist'] / modified if modified > 0 else 0,
-            'penalized': stats['safety_violations_penalized'],
-        }
-    
-    def _apply_subgoal_safety_constraint(
-        self, 
-        subgoal: np.ndarray, 
-        state: np.ndarray
-    ) -> np.ndarray:
-        """
-        应用基于深度信息的子目标安全约束
-        
-        Args:
-            subgoal: 原始子目标 [x, y]
-            state: 当前状态 [x, y, θ, v, ω, depth_1, ..., depth_n]
-            
-        Returns:
-            safe_subgoal: 安全子目标 [x, y]
-        """
-        if not self.use_subgoal_safety_constraint:
-            return subgoal
-        
-        if self.depth_dim == 0:
-            return subgoal
-        
-        # 提取深度读数
-        depth_readings = state[self.base_state_dim:]
-        
-        # 投影到安全区域
-        safe_subgoal = project_subgoal_to_safe_region(
-            subgoal=subgoal,
-            state=state,
-            depth_readings=depth_readings,
-            depth_fov=self.depth_fov,
-            safe_margin=self.subgoal_safe_margin,
-            min_subgoal_dist=self.subgoal_min_dist,
-        )
-        
-        return safe_subgoal
     
     def _create_high_level_policy(
         self,
@@ -479,46 +316,16 @@ class HAC:
                         else:
                             action = np.random.uniform(self.subgoal_clip_low, self.subgoal_clip_high)
                 
-                # ============ 应用子目标安全约束 (硬约束) ============
-                # 将子目标投影到深度感知范围内的安全区域
-                original_action = None
-                subgoal_was_unsafe = False
-                if i_level == 1 and self.use_subgoal_safety_constraint:
-                    original_action = action.copy()
-                    action = self._apply_subgoal_safety_constraint(action, state)
-                    # 确保仍在动作范围内
-                    action = action.clip(self.subgoal_clip_low, self.subgoal_clip_high)
-                    # 检查子目标是否被修改（说明原始子目标不安全）
-                    modification_dist = np.linalg.norm(original_action - action)
-                    subgoal_was_unsafe = modification_dist > 0.1
-                    
-                    # 更新安全统计
-                    self.safety_stats['total_subgoals'] += 1
-                    if subgoal_was_unsafe:
-                        self.safety_stats['modified_subgoals'] += 1
-                        self.safety_stats['total_modification_dist'] += modification_dist
-                
                 # 决定是否测试子目标
                 is_next_subgoal_test = is_subgoal_test
                 if np.random.random_sample() < self.lamda:
                     is_next_subgoal_test = True
                 
-                # 递归调用下一层（使用安全子目标）
+                # 递归调用下一层
                 next_state, done = self.run_HAC(env, i_level - 1, state, action, is_next_subgoal_test)
                 
-                # ============ Safety Violation Transition ============
-                # 如果原始子目标不安全（被约束修改），存储惩罚转换
-                # 这教会网络：输出危险子目标会被惩罚
-                if subgoal_was_unsafe and original_action is not None:
-                    # 惩罚原始的不安全子目标（类似 subgoal testing 但针对安全性）
-                    # 使用较小的惩罚，不要完全覆盖正常学习信号
-                    safety_penalty = -self.H * self.safety_penalty_ratio
-                    self.replay_buffer[i_level].add((
-                        state, original_action, safety_penalty, next_state, goal, 0.0, float(done)
-                    ))
-                    self.safety_stats['safety_violations_penalized'] += 1
-                
-                # Subgoal Testing Transition（针对安全子目标）
+                # Subgoal Testing Transition (HAC 论文核心机制)
+                # 如果子目标被测试且未达成，惩罚该子目标
                 if is_next_subgoal_test and not self.check_goal(next_state, action, self.threshold):
                     self.replay_buffer[i_level].add((
                         state, action, -self.H, next_state, goal, 0.0, float(done)

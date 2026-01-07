@@ -175,7 +175,6 @@ def train(args):
         
         # 运行 episode
         agent.reset_episode()
-        agent.reset_safety_stats()  # 重置安全统计
         state, _ = env.reset(seed=config.random_seed if episode == 1 else None)
         
         if hasattr(env.unwrapped, 'obstacles'):
@@ -217,25 +216,10 @@ def train(args):
             phase_str = "[P2-RL]"
             e2e_str = ""
         
-        # 安全统计
-        safety = agent.get_safety_stats()
-        if safety['total'] > 0:
-            safety_str = f" Safe:{safety['modified']}/{safety['total']}({100*safety['rate']:.0f}%)"
-        else:
-            safety_str = ""
-        
         # 记录
         writer.add_scalar('Reward/Episode', agent.reward, episode)
         writer.add_scalar('Steps/Episode', agent.timestep, episode)
         writer.add_scalar('Phase', current_phase, episode)
-        
-        # 记录安全约束统计 (复用上面获取的 safety)
-        if safety['total'] > 0:
-            writer.add_scalar('Safety/ModificationRate', safety['rate'], episode)
-            writer.add_scalar('Safety/NumModified', safety['modified'], episode)
-            writer.add_scalar('Safety/NumPenalized', safety['penalized'], episode)
-            if safety['modified'] > 0:
-                writer.add_scalar('Safety/AvgModDist', safety['avg_mod_dist'], episode)
         
         log_file.write(f'{episode},{agent.reward},{current_phase}\n')
         log_file.flush()
@@ -248,7 +232,7 @@ def train(args):
         if episode % config.save_episode == 0:
             agent.save(save_dir, config.get_filename())
         
-        print(f"{phase_str} Ep:{episode} R:{agent.reward:.2f} Steps:{agent.timestep}{e2e_str}{safety_str}")
+        print(f"{phase_str} Ep:{episode} R:{agent.reward:.2f} Steps:{agent.timestep}{e2e_str}")
     
     writer.close()
     log_file.close()
