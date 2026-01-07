@@ -45,6 +45,13 @@ class BaseConfig:
     lr: float = 0.001                     # 学习率
     n_iter: int = 100                     # 每次更新的迭代次数
     batch_size: int = 100                 # 批大小
+    hidden_dim: int = 64                  # 隐藏层维度
+    
+    # ==================== SAC 专用参数 ====================
+    sac_alpha: float = 0.2                # 初始熵系数 (auto_entropy=False 时使用)
+    sac_auto_entropy: bool = True         # 是否自动调节熵系数
+    sac_target_entropy: float = None      # 目标熵 (None=自动: -action_dim)
+    sac_alpha_lr: float = None            # 熵系数学习率 (None=使用 lr)
     
     # ==================== 探索噪声 ====================
     exploration_action_noise: np.ndarray = None   # 动作探索噪声

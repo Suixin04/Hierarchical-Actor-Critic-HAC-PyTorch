@@ -1,0 +1,706 @@
+"""
+可微模型预测控制 (Differentiable MPC) 模块
+
+支持:
+- 双轮差速机器人动力学模型 (Unicycle Model)
+- 可微优化层 (通过 PyTorch 自动求导)
+- 软约束避障
+- 梯度回传到子目标
+
+动力学模型:
+    ẋ = v * cos(θ)
+    ẏ = v * sin(θ)
+    θ̇ = ω
+    v̇ = a_v
+    ω̇ = a_ω
+
+Author: HAC + MPC Project
+"""
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from typing import Optional, Tuple, List
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
+class DifferentiableDynamics(nn.Module):
+    """
+    可微的双轮差速机器人动力学模型
+    
+    State: [x, y, θ, v, ω]
+    Action: [a_v, a_ω]
+    
+    离散化 (Euler):
+        x_{t+1} = x_t + v_t * cos(θ_t) * dt
+        y_{t+1} = y_t + v_t * sin(θ_t) * dt
+        θ_{t+1} = θ_t + ω_t * dt
+        v_{t+1} = v_t + a_v * dt
+        ω_{t+1} = ω_t + a_ω * dt
+    """
+    
+    def __init__(
+        self,
+        dt: float = 0.1,
+        max_v: float = 2.0,
+        max_omega: float = 2.0,
+    ):
+        super().__init__()
+        self.dt = dt
+        self.max_v = max_v
+        self.max_omega = max_omega
+    
+    def forward(
+        self, 
+        state: torch.Tensor, 
+        action: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        单步动力学前向传播
+        
+        Args:
+            state: [batch, 5] - [x, y, θ, v, ω]
+            action: [batch, 2] - [a_v, a_ω]
+            
+        Returns:
+            next_state: [batch, 5]
+        """
+        x = state[:, 0]
+        y = state[:, 1]
+        theta = state[:, 2]
+        v = state[:, 3]
+        omega = state[:, 4]
+        
+        a_v = action[:, 0]
+        a_omega = action[:, 1]
+        
+        # Euler 积分
+        x_new = x + v * torch.cos(theta) * self.dt
+        y_new = y + v * torch.sin(theta) * self.dt
+        theta_new = theta + omega * self.dt
+        v_new = v + a_v * self.dt
+        omega_new = omega + a_omega * self.dt
+        
+        # 角度归一化到 [-π, π]
+        theta_new = torch.atan2(torch.sin(theta_new), torch.cos(theta_new))
+        
+        # 速度裁剪
+        v_new = torch.clamp(v_new, -self.max_v, self.max_v)
+        omega_new = torch.clamp(omega_new, -self.max_omega, self.max_omega)
+        
+        next_state = torch.stack([x_new, y_new, theta_new, v_new, omega_new], dim=1)
+        return next_state
+    
+    def rollout(
+        self, 
+        init_state: torch.Tensor, 
+        actions: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        多步轨迹展开
+        
+        Args:
+            init_state: [batch, 5] 初始状态
+            actions: [batch, horizon, 2] 控制序列
+            
+        Returns:
+            states: [batch, horizon+1, 5] 状态轨迹 (包含初始状态)
+        """
+        batch_size = init_state.shape[0]
+        horizon = actions.shape[1]
+        
+        states = [init_state]
+        state = init_state
+        
+        for t in range(horizon):
+            state = self.forward(state, actions[:, t, :])
+            states.append(state)
+        
+        return torch.stack(states, dim=1)
+
+
+class MPCCost(nn.Module):
+    """
+    MPC 代价函数
+    
+    J = Σ stage_cost + terminal_cost
+    
+    stage_cost = ||pos - goal||²_Q + ||action||²_R + obstacle_cost
+    terminal_cost = ||pos - goal||²_Qf
+    """
+    
+    def __init__(
+        self,
+        Q: torch.Tensor = None,           # 位置误差权重 [2]
+        R: torch.Tensor = None,           # 控制代价权重 [2]
+        Qf: torch.Tensor = None,          # 终端代价权重 [2]
+        obstacle_weight: float = 10.0,    # 避障权重
+        safe_distance: float = 0.5,       # 安全距离
+    ):
+        super().__init__()
+        
+        # 默认权重
+        if Q is None:
+            Q = torch.tensor([1.0, 1.0])
+        if R is None:
+            R = torch.tensor([0.1, 0.1])
+        if Qf is None:
+            Qf = torch.tensor([10.0, 10.0])
+        
+        self.register_buffer('Q', Q)
+        self.register_buffer('R', R)
+        self.register_buffer('Qf', Qf)
+        self.obstacle_weight = obstacle_weight
+        self.safe_distance = safe_distance
+    
+    def position_cost(
+        self, 
+        states: torch.Tensor, 
+        goal: torch.Tensor,
+        terminal: bool = False
+    ) -> torch.Tensor:
+        """
+        位置误差代价
+        
+        Args:
+            states: [batch, 5] 或 [batch, horizon, 5]
+            goal: [batch, 2] 目标位置 [gx, gy]
+            terminal: 是否为终端代价
+            
+        Returns:
+            cost: [batch] 或 [batch, horizon]
+        """
+        weight = self.Qf if terminal else self.Q
+        
+        if states.dim() == 2:
+            # [batch, 5]
+            pos = states[:, :2]  # [batch, 2]
+            error = pos - goal  # [batch, 2]
+            cost = (error ** 2 * weight).sum(dim=1)
+        else:
+            # [batch, horizon, 5]
+            pos = states[:, :, :2]  # [batch, horizon, 2]
+            goal_expanded = goal.unsqueeze(1)  # [batch, 1, 2]
+            error = pos - goal_expanded  # [batch, horizon, 2]
+            cost = (error ** 2 * weight).sum(dim=2)  # [batch, horizon]
+        
+        return cost
+    
+    def control_cost(self, actions: torch.Tensor) -> torch.Tensor:
+        """
+        控制代价
+        
+        Args:
+            actions: [batch, horizon, 2]
+            
+        Returns:
+            cost: [batch, horizon]
+        """
+        cost = (actions ** 2 * self.R).sum(dim=2)
+        return cost
+    
+    def obstacle_cost(
+        self, 
+        states: torch.Tensor, 
+        obstacles: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        软约束避障代价 (可微)
+        
+        cost = Σ_obs weight * ReLU(safe_dist - dist)²
+        
+        Args:
+            states: [batch, horizon+1, 5]
+            obstacles: [num_obs, 3] - [x, y, radius]
+            
+        Returns:
+            cost: [batch, horizon+1]
+        """
+        if obstacles is None or len(obstacles) == 0:
+            return torch.zeros(states.shape[0], states.shape[1], device=states.device)
+        
+        pos = states[:, :, :2]  # [batch, horizon+1, 2]
+        batch_size, horizon_plus_1, _ = pos.shape
+        num_obs = obstacles.shape[0]
+        
+        # 展开计算
+        pos_expanded = pos.unsqueeze(2)  # [batch, horizon+1, 1, 2]
+        obs_pos = obstacles[:, :2].unsqueeze(0).unsqueeze(0)  # [1, 1, num_obs, 2]
+        obs_radius = obstacles[:, 2].unsqueeze(0).unsqueeze(0)  # [1, 1, num_obs]
+        
+        # 计算距离
+        dist = torch.norm(pos_expanded - obs_pos, dim=3)  # [batch, horizon+1, num_obs]
+        
+        # 软约束: ReLU(safe_dist + radius - dist)²
+        margin = self.safe_distance + obs_radius - dist
+        violation = F.relu(margin) ** 2  # [batch, horizon+1, num_obs]
+        
+        # 对所有障碍物求和
+        cost = self.obstacle_weight * violation.sum(dim=2)  # [batch, horizon+1]
+        
+        return cost
+    
+    def forward(
+        self,
+        states: torch.Tensor,
+        actions: torch.Tensor,
+        goal: torch.Tensor,
+        obstacles: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        计算总代价
+        
+        Args:
+            states: [batch, horizon+1, 5] 状态轨迹
+            actions: [batch, horizon, 2] 控制序列
+            goal: [batch, 2] 目标位置
+            obstacles: [num_obs, 3] 障碍物
+            
+        Returns:
+            total_cost: [batch] 总代价
+        """
+        horizon = actions.shape[1]
+        
+        # Stage costs (不含最后一个状态)
+        stage_states = states[:, :-1, :]  # [batch, horizon, 5]
+        pos_cost = self.position_cost(stage_states, goal, terminal=False)  # [batch, horizon]
+        ctrl_cost = self.control_cost(actions)  # [batch, horizon]
+        
+        # Terminal cost
+        terminal_state = states[:, -1, :]  # [batch, 5]
+        term_cost = self.position_cost(terminal_state, goal, terminal=True)  # [batch]
+        
+        # Obstacle cost
+        obs_cost = self.obstacle_cost(states, obstacles)  # [batch, horizon+1]
+        
+        # 总代价
+        total_cost = (
+            pos_cost.sum(dim=1) + 
+            ctrl_cost.sum(dim=1) + 
+            term_cost + 
+            obs_cost.sum(dim=1)
+        )
+        
+        return total_cost
+
+
+class DifferentiableMPC(nn.Module):
+    """
+    可微 MPC 控制器
+    
+    通过梯度下降优化控制序列，支持梯度回传到目标
+    
+    使用迭代 LQR / iLQR 风格的优化，但用 PyTorch 自动求导简化实现
+    """
+    
+    def __init__(
+        self,
+        horizon: int = 10,
+        dt: float = 0.1,
+        max_v: float = 2.0,
+        max_omega: float = 2.0,
+        max_a_v: float = 1.0,
+        max_a_omega: float = 2.0,
+        num_iterations: int = 5,        # MPC 内部优化迭代次数
+        lr: float = 0.5,                 # MPC 优化学习率
+        Q: torch.Tensor = None,
+        R: torch.Tensor = None,
+        Qf: torch.Tensor = None,
+        obstacle_weight: float = 10.0,
+        safe_distance: float = 0.5,
+    ):
+        super().__init__()
+        
+        self.horizon = horizon
+        self.max_a_v = max_a_v
+        self.max_a_omega = max_a_omega
+        self.num_iterations = num_iterations
+        self.lr = lr
+        
+        # 动力学模型
+        self.dynamics = DifferentiableDynamics(
+            dt=dt, max_v=max_v, max_omega=max_omega
+        )
+        
+        # 代价函数
+        self.cost_fn = MPCCost(
+            Q=Q, R=R, Qf=Qf,
+            obstacle_weight=obstacle_weight,
+            safe_distance=safe_distance
+        )
+        
+        # 暖启动：保存上一次的解
+        self.prev_actions = None
+    
+    def _init_actions(self, batch_size: int) -> torch.Tensor:
+        """
+        初始化控制序列 (暖启动或零初始化)
+        
+        Returns:
+            actions: [batch, horizon, 2] with requires_grad=True
+        """
+        if self.prev_actions is not None and self.prev_actions.shape[0] == batch_size:
+            # 暖启动: 左移一步，最后一步用零填充
+            actions = torch.cat([
+                self.prev_actions[:, 1:, :],
+                torch.zeros(batch_size, 1, 2, device=self.prev_actions.device)
+            ], dim=1).clone().detach()
+        else:
+            # 零初始化
+            actions = torch.zeros(batch_size, self.horizon, 2, device=device)
+        
+        # 确保 requires_grad=True 用于优化
+        actions = actions.requires_grad_(True)
+        return actions
+    
+    def _clip_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        """裁剪动作到约束范围"""
+        a_v = torch.clamp(actions[:, :, 0], -self.max_a_v, self.max_a_v)
+        a_omega = torch.clamp(actions[:, :, 1], -self.max_a_omega, self.max_a_omega)
+        return torch.stack([a_v, a_omega], dim=2)
+    
+    def forward(
+        self,
+        state: torch.Tensor,
+        goal: torch.Tensor,
+        obstacles: Optional[torch.Tensor] = None,
+        return_trajectory: bool = False
+    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+        """
+        求解 MPC 并返回最优动作
+        
+        这是一个纯优化过程，不需要对输入求梯度。
+        (端到端训练使用 get_action_with_gradient 方法)
+        
+        Args:
+            state: [batch, state_dim] 当前状态 (可能含深度，只用前5维)
+            goal: [batch, 2] 子目标位置
+            obstacles: [num_obs, 3] 障碍物 [x, y, radius]
+            return_trajectory: 是否返回预测轨迹
+            
+        Returns:
+            action: [batch, 2] 最优动作 (第一步)
+            cost: [batch] 总代价
+            info: dict 包含预测轨迹等信息
+        """
+        batch_size = state.shape[0]
+        
+        # 只使用状态的前5维 [x, y, θ, v, ω]
+        # detach 确保不影响外部计算图
+        base_state = state[:, :5].detach()
+        goal_detached = goal.detach()
+        
+        # 初始化控制序列作为可优化参数
+        actions_data = torch.zeros(batch_size, self.horizon, 2, device=state.device)
+        
+        # 暖启动
+        if self.prev_actions is not None and self.prev_actions.shape[0] == batch_size:
+            actions_data = torch.cat([
+                self.prev_actions[:, 1:, :],
+                torch.zeros(batch_size, 1, 2, device=state.device)
+            ], dim=1).clone()
+        
+        # 使用简单梯度下降优化
+        for iteration in range(self.num_iterations):
+            # 创建需要梯度的副本
+            actions = actions_data.clone().requires_grad_(True)
+            
+            # 前向传播: 展开轨迹
+            clipped_actions = self._clip_actions(actions)
+            states = self.dynamics.rollout(base_state, clipped_actions)
+            
+            # 计算代价
+            cost = self.cost_fn(states, clipped_actions, goal_detached, obstacles)
+            total_cost = cost.sum()
+            
+            # 计算梯度
+            total_cost.backward()
+            
+            # 梯度下降更新
+            with torch.no_grad():
+                actions_data = actions_data - self.lr * actions.grad
+                # 裁剪到有效范围
+                actions_data[:, :, 0].clamp_(-self.max_a_v, self.max_a_v)
+                actions_data[:, :, 1].clamp_(-self.max_a_omega, self.max_a_omega)
+        
+        # 最终解
+        final_actions = actions_data.detach()
+        with torch.no_grad():
+            final_states = self.dynamics.rollout(base_state, final_actions)
+            final_cost = self.cost_fn(final_states, final_actions, goal_detached, obstacles)
+        
+        # 保存用于暖启动
+        self.prev_actions = final_actions.clone()
+        
+        # 返回第一步动作
+        first_action = final_actions[:, 0, :]
+        
+        info = {
+            'predicted_trajectory': final_states if return_trajectory else None,
+            'planned_actions': final_actions,
+            'cost': final_cost
+        }
+        
+        return first_action, final_cost, info
+    
+    def get_action_with_gradient(
+        self,
+        state: torch.Tensor,
+        goal: torch.Tensor,
+        obstacles: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        获取动作，同时保留对 goal 的梯度
+        
+        这是端到端训练的关键函数！
+        
+        原理: 使用隐函数定理
+        - MPC 的解 u* 是 goal g 的函数
+        - 通过自动微分计算 ∂u*/∂g
+        
+        Args:
+            state: [batch, state_dim]
+            goal: [batch, 2] (需要 requires_grad=True)
+            obstacles: [num_obs, 3]
+            
+        Returns:
+            action: [batch, 2] (梯度连接到 goal)
+            predicted_next_state: [batch, 5]
+        """
+        batch_size = state.shape[0]
+        base_state = state[:, :5]
+        
+        # 固定迭代次数的展开 (unrolled optimization)
+        # 这样梯度可以通过整个优化过程回传
+        actions = torch.zeros(
+            batch_size, self.horizon, 2, 
+            device=state.device, 
+            requires_grad=True
+        )
+        
+        for _ in range(self.num_iterations):
+            # 前向
+            clipped_actions = self._clip_actions(actions)
+            states = self.dynamics.rollout(base_state, clipped_actions)
+            cost = self.cost_fn(states, clipped_actions, goal, obstacles)
+            
+            # 计算梯度
+            grad = torch.autograd.grad(
+                cost.sum(), actions, 
+                create_graph=True,  # 关键: 保留计算图
+                retain_graph=True
+            )[0]
+            
+            # 梯度下降更新
+            actions = actions - self.lr * grad
+        
+        # 最终动作
+        final_actions = self._clip_actions(actions)
+        final_states = self.dynamics.rollout(base_state, final_actions)
+        
+        first_action = final_actions[:, 0, :]
+        predicted_next_state = final_states[:, 1, :]  # 预测的下一状态
+        
+        return first_action, predicted_next_state
+
+
+class MPCWrapper:
+    """
+    MPC 包装器，提供与 DDPG/SAC 相同的接口
+    
+    用于替换 HAC 的底层策略
+    """
+    
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        goal_dim: int,
+        action_bounds: torch.Tensor,
+        action_offset: torch.Tensor,
+        horizon: int = 10,
+        dt: float = 0.1,
+        max_v: float = 2.0,
+        max_omega: float = 2.0,
+        max_a_v: float = 1.0,
+        max_a_omega: float = 2.0,
+        num_iterations: int = 5,
+        lr: float = 0.5,
+        Q: torch.Tensor = None,
+        R: torch.Tensor = None,
+        Qf: torch.Tensor = None,
+        obstacle_weight: float = 10.0,
+        safe_distance: float = 0.5,
+        **kwargs
+    ):
+        """
+        Args:
+            state_dim: 状态维度 (可能含深度)
+            action_dim: 动作维度 (2: [a_v, a_ω])
+            goal_dim: 目标维度 (2: [x, y])
+            action_bounds: 动作边界
+            action_offset: 动作偏移
+            horizon: MPC 预测步长
+            dt: 时间步长
+            num_iterations: MPC 优化迭代次数
+            lr: MPC 优化学习率
+            Q, R, Qf: 代价函数权重
+            obstacle_weight: 避障权重
+            safe_distance: 安全距离
+        """
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.goal_dim = goal_dim
+        
+        self.mpc = DifferentiableMPC(
+            horizon=horizon,
+            dt=dt,
+            max_v=max_v,
+            max_omega=max_omega,
+            max_a_v=max_a_v,
+            max_a_omega=max_a_omega,
+            num_iterations=num_iterations,
+            lr=lr,
+            Q=Q,
+            R=R,
+            Qf=Qf,
+            obstacle_weight=obstacle_weight,
+            safe_distance=safe_distance,
+        ).to(device)
+        
+        # 当前障碍物信息 (需要从环境获取)
+        self.obstacles = None
+    
+    def set_obstacles(self, obstacles: List[Tuple[float, float, float]]):
+        """
+        设置障碍物信息
+        
+        Args:
+            obstacles: List of (x, y, radius)
+        """
+        if obstacles:
+            self.obstacles = torch.tensor(obstacles, dtype=torch.float32, device=device)
+        else:
+            self.obstacles = None
+    
+    def select_action(
+        self, 
+        state: np.ndarray, 
+        goal: np.ndarray, 
+        deterministic: bool = True
+    ) -> np.ndarray:
+        """
+        选择动作 (与 DDPG/SAC 接口一致)
+        
+        Args:
+            state: 状态
+            goal: 子目标 [x, y]
+            deterministic: MPC 本身是确定性的
+            
+        Returns:
+            action: [a_v, a_ω]
+        """
+        state_t = torch.FloatTensor(state.reshape(1, -1)).to(device)
+        goal_t = torch.FloatTensor(goal.reshape(1, -1)).to(device)
+        
+        # 注意: 不用 torch.no_grad()，因为 MPC forward 内部需要计算梯度来优化
+        action, _, _ = self.mpc(state_t, goal_t, self.obstacles)
+        
+        return action.detach().cpu().numpy().flatten()
+    
+    def update(self, buffer, n_iter: int, batch_size: int):
+        """
+        MPC 不需要学习更新 (基于模型的方法)
+        保留接口兼容性
+        """
+        pass
+    
+    def save(self, directory: str, name: str):
+        """MPC 不需要保存参数"""
+        pass
+    
+    def load(self, directory: str, name: str):
+        """MPC 不需要加载参数"""
+        pass
+
+
+# ============== 用于端到端训练的任务损失 ==============
+
+class TaskLoss(nn.Module):
+    """
+    任务级损失函数 (用于端到端训练高层策略)
+    
+    L = L_goal + α * L_obstacle + β * L_control + γ * L_smooth
+    """
+    
+    def __init__(
+        self,
+        goal_weight: float = 1.0,
+        obstacle_weight: float = 5.0,
+        control_weight: float = 0.1,
+        smooth_weight: float = 0.1,
+        safe_distance: float = 0.5,
+    ):
+        super().__init__()
+        self.goal_weight = goal_weight
+        self.obstacle_weight = obstacle_weight
+        self.control_weight = control_weight
+        self.smooth_weight = smooth_weight
+        self.safe_distance = safe_distance
+    
+    def forward(
+        self,
+        trajectory: torch.Tensor,
+        actions: torch.Tensor,
+        final_goal: torch.Tensor,
+        obstacles: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, dict]:
+        """
+        计算任务损失
+        
+        Args:
+            trajectory: [batch, T, 5] 实际轨迹
+            actions: [batch, T-1, 2] 控制序列
+            final_goal: [batch, 2] 最终目标
+            obstacles: [num_obs, 3]
+            
+        Returns:
+            total_loss: [batch]
+            loss_dict: 各项损失分解
+        """
+        # 到达目标损失
+        final_pos = trajectory[:, -1, :2]
+        goal_loss = self.goal_weight * ((final_pos - final_goal) ** 2).sum(dim=1)
+        
+        # 避障损失
+        obstacle_loss = torch.zeros(trajectory.shape[0], device=trajectory.device)
+        if obstacles is not None and len(obstacles) > 0:
+            pos = trajectory[:, :, :2]  # [batch, T, 2]
+            for obs in obstacles:
+                ox, oy, radius = obs
+                dist = torch.norm(pos - obs[:2], dim=2)  # [batch, T]
+                violation = F.relu(self.safe_distance + radius - dist)
+                obstacle_loss += self.obstacle_weight * (violation ** 2).sum(dim=1)
+        
+        # 控制代价
+        control_loss = self.control_weight * (actions ** 2).sum(dim=(1, 2))
+        
+        # 平滑代价 (动作变化率)
+        if actions.shape[1] > 1:
+            action_diff = actions[:, 1:, :] - actions[:, :-1, :]
+            smooth_loss = self.smooth_weight * (action_diff ** 2).sum(dim=(1, 2))
+        else:
+            smooth_loss = torch.zeros_like(control_loss)
+        
+        total_loss = goal_loss + obstacle_loss + control_loss + smooth_loss
+        
+        loss_dict = {
+            'goal': goal_loss.mean().item(),
+            'obstacle': obstacle_loss.mean().item(),
+            'control': control_loss.mean().item(),
+            'smooth': smooth_loss.mean().item(),
+            'total': total_loss.mean().item()
+        }
+        
+        return total_loss, loss_dict

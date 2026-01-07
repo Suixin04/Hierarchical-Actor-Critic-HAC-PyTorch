@@ -240,6 +240,8 @@ class SAC:
         hidden_dim: int = 64,
         alpha: float = 0.2,
         auto_entropy: bool = True,
+        target_entropy: float = None,     # None = -action_dim
+        alpha_lr: float = None,           # None = 使用 lr
         # 独立编码器参数
         use_depth_encoder: bool = False,
         base_state_dim: int = 5,
@@ -288,10 +290,12 @@ class SAC:
         # 自动熵调节
         self.auto_entropy = auto_entropy
         if auto_entropy:
-            # 标准目标熵: -dim(A)
-            self.target_entropy = -action_dim
+            # 目标熵: 可配置，默认 -dim(A)
+            self.target_entropy = target_entropy if target_entropy is not None else -action_dim
             self.log_alpha = torch.zeros(1, requires_grad=True, device=device)
-            self.alpha_optimizer = optim.Adam([self.log_alpha], lr=lr)
+            # alpha 学习率: 可配置，默认使用 lr
+            _alpha_lr = alpha_lr if alpha_lr is not None else lr
+            self.alpha_optimizer = optim.Adam([self.log_alpha], lr=_alpha_lr)
             self.alpha = self.log_alpha.exp().item()
         else:
             self.alpha = alpha

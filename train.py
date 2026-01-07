@@ -98,6 +98,10 @@ def train(args):
         # 重置环境
         state, _ = env.reset(seed=config.random_seed if episode == 1 else None)
         
+        # 设置障碍物信息给 MPC
+        if hasattr(env.unwrapped, 'obstacles'):
+            agent.set_obstacles(env.unwrapped.obstacles)
+        
         # 运行 HAC
         last_state, done = agent.run_HAC(
             env, 
@@ -119,7 +123,7 @@ def train(args):
         
         # ===== TensorBoard 记录 (每 100 个 episode) =====
         if episode % 100 == 0:
-            # 如果有深度编码器，绘制相关性散点图 (使用底层 level 0 的编码器)
+            # 如果有深度编码器，绘制相关性散点图
             if agent.use_depth_encoder and agent.algorithm == 'sac':
                 visualize_encoder_to_tensorboard(writer, agent, env, config, episode)
             solved_count = 0
@@ -173,9 +177,10 @@ def visualize_encoder_to_tensorboard(writer, agent, env, config, episode):
     min_depths = np.array(min_depths)
     front_depths = np.array(front_depths)
     
-    # 为每层编码器生成图
-    for level in range(agent.k_level):
-        encoder = agent.HAC[level].depth_encoder
+    # 为每层编码器生成图 (Level 0 是 MPC，从 Level 1 开始)
+    for level in range(1, agent.k_level):
+        policy = agent.HAC[level]
+        encoder = getattr(policy, 'depth_encoder', None)
         if encoder is None:
             continue
         

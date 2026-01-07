@@ -75,7 +75,7 @@ def test(args):
     # 创建 HAC 智能体
     agent = HAC(config, render=args.render, algorithm=config.algorithm)
     
-    # 加载模型 (默认优先加载 solved 版本)
+    # 加载模型 (Level 0 是 MPC 无需加载，从 Level 1 开始加载)
     model_dir = config.get_save_directory()
     if args.model:
         model_name = args.model
@@ -83,7 +83,8 @@ def test(args):
         # 优先尝试 solved 版本
         solved_name = config.get_filename() + '_solved'
         import os
-        solved_path = os.path.join(model_dir, f"{solved_name}_level_0_actor.pth")
+        # Level 1 是第一个需要加载的策略
+        solved_path = os.path.join(model_dir, f"{solved_name}_level_1_actor.pth")
         if os.path.exists(solved_path):
             model_name = solved_name
             print("Found solved model, loading it...")
@@ -104,6 +105,10 @@ def test(args):
         
         # 重置环境
         state, _ = env.reset(seed=config.random_seed if episode == 1 else None)
+        
+        # 设置障碍物信息给 MPC
+        if hasattr(env.unwrapped, 'obstacles'):
+            agent.set_obstacles(env.unwrapped.obstacles)
         
         # 运行 HAC (测试模式: is_subgoal_test=True, 不添加探索噪声)
         last_state, done = agent.run_HAC(
