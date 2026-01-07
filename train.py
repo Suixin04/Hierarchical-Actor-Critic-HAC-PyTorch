@@ -1,18 +1,18 @@
 """
-HAC 训练脚本
+HAC 分阶段训练脚本 (清理版)
 
 用法:
-    python train.py                                    # 默认 DDPG
-    python train.py --algorithm sac                    # 使用 SAC
-    python train.py --env Pendulum-h-v1               # Pendulum
-    python train.py --env MountainCarContinuous-h-v1 --k_level 3  # 3层
-    python train.py --render                           # 开启渲染
+    python train.py --env Navigation2DObstacle-v1       # 默认分阶段训练
+    python train.py --e2e_episodes 300                  # E2E预热300回合
+    python train.py --render                            # 开启渲染
     
-端到端训练 (End-to-End Training):
-    python train.py --e2e                             # 启用端到端训练
-    python train.py --e2e --e2e_start 500             # RL预热500步后启用E2E
-    python train.py --e2e --e2e_freq 10               # 每10步执行一次E2E更新
-    python train.py --e2e --e2e_lr 1e-4               # 设置E2E学习率
+训练阶段:
+    Phase 1 (E2E预热): 只用E2E更新编码器，RL更新策略(编码器输出detach)
+    Phase 2 (RL微调):  编码器固定，RL正常更新策略
+    
+梯度流保证:
+    - Phase 1: Encoder ← E2E only, Policy ← RL (encoder detached)
+    - Phase 2: Encoder ❄️ frozen, Policy ← RL
 """
 import argparse
 import torch
@@ -26,316 +26,225 @@ from HAC import HAC
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='HAC Training')
+    parser = argparse.ArgumentParser(description='HAC Staged Training')
     parser.add_argument('--env', type=str, default='Navigation2DObstacle-v1',
                         help='Environment name')
     parser.add_argument('--algorithm', type=str, default='sac',
                         choices=['ddpg', 'sac'],
-                        help='Base algorithm (ddpg or sac), overrides config')
+                        help='High-level algorithm')
     parser.add_argument('--k_level', type=int, default=None,
-                        help='Number of hierarchy levels (overrides config)')
+                        help='Number of hierarchy levels')
     parser.add_argument('--max_episodes', type=int, default=None,
-                        help='Max training episodes (overrides config)')
+                        help='Max training episodes')
     parser.add_argument('--render', action='store_true',
                         help='Enable rendering')
     parser.add_argument('--seed', type=int, default=None,
-                        help='Random seed (overrides config)')
+                        help='Random seed')
     
-    # 端到端训练参数
-    parser.add_argument('--e2e', action='store_true',
-                        help='Enable end-to-end differentiable training')
-    parser.add_argument('--e2e_start', type=int, default=0,
-                        help='Episode to start E2E training (for RL warmup)')
-    parser.add_argument('--e2e_freq', type=int, default=5,
-                        help='Frequency of E2E updates (every N episodes)')
-    parser.add_argument('--e2e_lr', type=float, default=1e-4,
+    # E2E 预热参数
+    parser.add_argument('--e2e_episodes', type=int, default=100,
+                        help='Number of episodes for E2E warmup phase')
+    parser.add_argument('--e2e_freq', type=int, default=3,
+                        help='E2E update frequency (every N episodes)')
+    parser.add_argument('--e2e_lr', type=float, default=3e-4,
                         help='Learning rate for E2E training')
-    parser.add_argument('--e2e_batch', type=int, default=32,
+    parser.add_argument('--e2e_batch', type=int, default=128,
                         help='Batch size for E2E training')
-    parser.add_argument('--e2e_only', action='store_true',
-                        help='Use only E2E training (no RL updates)')
+    parser.add_argument('--e2e_updates', type=int, default=10,
+                        help='Number of gradient updates per E2E call')
     
     return parser.parse_args()
 
 
+def run_e2e_training(agent, config, batch_size=64, lr=3e-4, num_updates=5):
+    """
+    E2E 训练：通过可微 MPC 更新 Encoder + Actor
+    
+    梯度流: TaskLoss → MPC轨迹 → 子目标 → Actor → Encoder
+    
+    Returns:
+        final_dist: 到目标的平均距离 (归一化指标)
+    """
+    if not hasattr(agent, 'mpc') or agent.mpc is None:
+        return None
+    
+    if agent.k_level < 2:
+        return None
+    
+    upper_level = agent.k_level - 1
+    buffer = agent.replay_buffer[upper_level]
+    if buffer is None or len(buffer) < batch_size:
+        return None
+    
+    losses = []
+    for _ in range(num_updates):
+        if hasattr(buffer, 'sample_states'):
+            states = buffer.sample_states(batch_size)
+        else:
+            batch = buffer.sample(batch_size)
+            states = batch[0]
+        
+        try:
+            loss_history = agent.train_end_to_end_batch(
+                states=states,
+                final_goal=np.array(config.goal_state),
+                num_steps=5,
+                lr=lr
+            )
+            if loss_history and 'total' in loss_history[0]:
+                losses.append(loss_history[0]['total'])
+        except Exception as e:
+            print(f"E2E error: {e}")
+            continue
+    
+    return losses[-1] if losses else None
+
+
 def train(args):
-    # 获取环境配置
+    """分阶段训练主函数"""
+    # 获取配置
     config = get_config(args.env)
     
-    # 命令行参数覆盖配置
-    if args.algorithm is not None:
+    # 命令行覆盖
+    if args.algorithm:
         config.algorithm = args.algorithm
-    if args.k_level is not None:
+    if args.k_level:
         config.k_level = args.k_level
-    if args.max_episodes is not None:
+    if args.max_episodes:
         config.max_episodes = args.max_episodes
-    if args.seed is not None:
+    if args.seed:
         config.random_seed = args.seed
     
+    # 强制设置 encoder_train_mode='e2e' (Phase 1 需要 RL detach encoder)
+    config.encoder_train_mode = 'e2e'
+    
     print("=" * 60)
-    print(f"HAC Training with {config.algorithm.upper()}")
-    if args.e2e:
-        print(f"End-to-End Training: ENABLED")
-        print(f"  - Start episode: {args.e2e_start}")
-        print(f"  - Update frequency: every {args.e2e_freq} episodes")
-        print(f"  - Learning rate: {args.e2e_lr}")
-        print(f"  - Batch size: {args.e2e_batch}")
-        print(f"  - E2E only mode: {args.e2e_only}")
+    print("  HAC STAGED TRAINING")
+    print("=" * 60)
+    print(f"  Phase 1 (E2E Warmup): Episodes 1-{args.e2e_episodes}")
+    print(f"    - Encoder: Updated by E2E only")
+    print(f"    - Policy: Updated by RL (encoder detached)")
+    print(f"  Phase 2 (RL Finetune): Episodes {args.e2e_episodes+1}-{config.max_episodes}")
+    print(f"    - Encoder: Frozen")
+    print(f"    - Policy: Updated by RL")
     print("=" * 60)
     print(config)
     print("=" * 60)
     
-    # 计算 HAC 需要的最大步数: H^k_level
+    # 环境
     max_steps = config.H ** config.k_level
-    print(f"Max steps per episode: H^k_level = {config.H}^{config.k_level} = {max_steps}")
-    
-    # 创建环境
     if args.render:
         env = gym.make(config.env_name, render_mode="human", max_steps=max_steps)
     else:
         env = gym.make(config.env_name, max_steps=max_steps)
     
-    # 设置随机种子
+    # 随机种子
     if config.random_seed:
-        print(f"Random Seed: {config.random_seed}")
         torch.manual_seed(config.random_seed)
         np.random.seed(config.random_seed)
     
-    # 创建 HAC 智能体
+    # HAC 智能体
     agent = HAC(config, render=args.render, algorithm=config.algorithm)
     
-    # 创建保存目录
+    # 保存目录
     save_dir = config.get_save_directory()
     os.makedirs(save_dir, exist_ok=True)
     
-    # TensorBoard 日志
+    # TensorBoard
     from torch.utils.tensorboard import SummaryWriter
-    log_dir = f"runs/{config.env_name}_{config.algorithm}"
-    writer = SummaryWriter(log_dir)
-    print(f"TensorBoard logs: {log_dir}")
-    print(f"Run: tensorboard --logdir=runs")
+    writer = SummaryWriter(f"runs/{config.env_name}_staged")
     
-    # 日志文件
     log_file = open("log.txt", "w+")
     
-    # 训练循环
-    solved_count = 0
-    e2e_losses = []  # 记录E2E损失
+    # ==================== 训练循环 ====================
+    current_phase = 1
+    e2e_losses = []
+    best_reward = float('-inf')
     
     for episode in range(1, config.max_episodes + 1):
-        agent.reset_episode()
+        # ========== 阶段切换 ==========
+        if current_phase == 1 and episode > args.e2e_episodes:
+            print("\n" + "=" * 60)
+            print("  PHASE TRANSITION: E2E Warmup -> RL Finetune")
+            print("  Freezing all encoders...")
+            print("=" * 60 + "\n")
+            
+            agent.freeze_all_encoders()
+            current_phase = 2
+            agent.save(save_dir, config.get_filename() + '_phase1')
         
-        # 重置环境
+        # 运行 episode
+        agent.reset_episode()
         state, _ = env.reset(seed=config.random_seed if episode == 1 else None)
         
-        # 设置障碍物信息给 MPC
         if hasattr(env.unwrapped, 'obstacles'):
             agent.set_obstacles(env.unwrapped.obstacles)
         
-        # 运行 HAC
         last_state, done = agent.run_HAC(
-            env, 
-            config.k_level - 1, 
-            state, 
-            config.goal_state, 
-            is_subgoal_test=False
+            env, config.k_level - 1, state, config.goal_state, is_subgoal_test=False
         )
         
-        # 检查是否解决
         solved = agent.check_goal(last_state, config.goal_state, config.goal_threshold)
         if solved:
             print("################ Solved! ################")
-            agent.save(save_dir, config.get_filename() + '_solved')
-            solved_count += 1
         
-        # 更新策略 (RL 更新)
-        if not args.e2e_only:
+        # ========== Phase 1: E2E 预热 ==========
+        if current_phase == 1:
+            # RL 更新策略 (encoder 输出被 detach，不会被 RL 更新)
             agent.update(config.n_iter, config.batch_size)
+            
+            # E2E 更新 Encoder + Actor
+            e2e_loss = None
+            if episode % args.e2e_freq == 0:
+                e2e_loss = run_e2e_training(
+                    agent, config,
+                    batch_size=args.e2e_batch,
+                    lr=args.e2e_lr,
+                    num_updates=args.e2e_updates
+                )
+                if e2e_loss is not None:
+                    e2e_losses.append(e2e_loss)
+                    writer.add_scalar('E2E/Distance', e2e_loss, episode)
+            
+            phase_str = "[P1-E2E]"
+            e2e_str = f" Dist:{e2e_loss:.2f}" if e2e_loss else ""
         
-        # 端到端更新
-        e2e_loss = None
-        if args.e2e and episode >= args.e2e_start and episode % args.e2e_freq == 0:
-            # 从 replay buffer 采样初始状态进行 E2E 训练
-            e2e_loss = run_e2e_training(
-                agent, env, config, 
-                batch_size=args.e2e_batch,
-                lr=args.e2e_lr
-            )
-            if e2e_loss is not None:
-                e2e_losses.append(e2e_loss)
-                writer.add_scalar('Loss/E2E', e2e_loss, episode)
+        # ========== Phase 2: RL 微调 ==========
+        else:
+            # 纯 RL 更新 (encoder 已冻结)
+            agent.update(config.n_iter, config.batch_size)
+            phase_str = "[P2-RL]"
+            e2e_str = ""
         
-        # ===== TensorBoard 记录 (每 100 个 episode) =====
-        if episode % 100 == 0:
-            # 如果有深度编码器，绘制相关性散点图
-            if agent.use_depth_encoder and agent.algorithm == 'sac':
-                visualize_encoder_to_tensorboard(writer, agent, env, config, episode)
-            solved_count = 0
+        # 记录
+        writer.add_scalar('Reward/Episode', agent.reward, episode)
+        writer.add_scalar('Steps/Episode', agent.timestep, episode)
+        writer.add_scalar('Phase', current_phase, episode)
         
-        # 记录日志
-        log_file.write(f'{episode},{agent.reward}\n')
+        log_file.write(f'{episode},{agent.reward},{current_phase}\n')
         log_file.flush()
         
-        # 定期保存
+        # 保存
+        if agent.reward > best_reward:
+            best_reward = agent.reward
+            agent.save(save_dir, config.get_filename() + '_best')
+        
         if episode % config.save_episode == 0:
             agent.save(save_dir, config.get_filename())
         
-        # 打印训练信息
-        e2e_str = f"\tE2E Loss: {e2e_loss:.4f}" if e2e_loss is not None else ""
-        print(f"Episode: {episode}\t Reward: {agent.reward:.2f}\t Steps: {agent.timestep}{e2e_str}")
+        print(f"{phase_str} Ep:{episode} R:{agent.reward:.2f} Steps:{agent.timestep}{e2e_str}")
     
     writer.close()
     log_file.close()
     env.close()
     
-    # 打印E2E训练统计
-    if args.e2e and e2e_losses:
-        print(f"\nE2E Training Summary:")
-        print(f"  - Total E2E updates: {len(e2e_losses)}")
-        print(f"  - Final E2E loss: {e2e_losses[-1]:.4f}")
-        print(f"  - Mean E2E loss: {np.mean(e2e_losses):.4f}")
-    
-    print("Training completed!")
-
-
-def run_e2e_training(agent, env, config, batch_size=32, lr=1e-4):
-    """
-    执行端到端可微分训练
-    
-    从 replay buffer 采样状态，通过可微分 MPC 计算梯度，更新上层策略
-    
-    Args:
-        agent: HAC 智能体
-        env: 环境
-        config: 配置
-        batch_size: 批次大小
-        lr: 学习率 (目前在 train_end_to_end 中使用固定学习率)
-        
-    Returns:
-        loss: E2E 损失值 (如果成功)，否则返回 None
-    """
-    # 检查是否支持 E2E 训练 (需要 MPC 底层)
-    if not hasattr(agent, 'mpc') or agent.mpc is None:
-        print("Warning: E2E training requires MPC at level 0. Skipping.")
-        return None
-    
-    # 检查上层是否有足够的经验
-    if agent.k_level < 2:
-        print("Warning: E2E training requires at least 2 levels. Skipping.")
-        return None
-    
-    upper_level = agent.k_level - 1  # 最上层 (SAC)
-    if len(agent.replay_buffer[upper_level]) < batch_size:
-        return None  # 经验不足，跳过
-    
-    # 从上层 buffer 采样状态
-    # sample 返回: (states, actions, rewards, next_states, goals, gammas, dones)
-    batch = agent.replay_buffer[upper_level].sample(batch_size)
-    states = batch[0]  # [batch_size, state_dim]
-    
-    # 使用 HAC 的端到端训练方法
-    try:
-        loss_history = agent.train_end_to_end_batch(
-            states=states,
-            final_goal=np.array(config.goal_state),
-            num_steps=5,    # 展开5步
-            num_epochs=1,   # 每次E2E更新训练1个epoch
-            verbose=False
-        )
-        
-        if loss_history:
-            return loss_history[-1]['avg_loss']
-        return None
-    except Exception as e:
-        print(f"E2E training error: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
-
-
-def visualize_encoder_to_tensorboard(writer, agent, env, config, episode):
-    """将各层编码器的 embedding 相关性散点图记录到 TensorBoard"""
-    import torch
-    import matplotlib
-    matplotlib.use('Agg')  # 非交互式后端
-    import matplotlib.pyplot as plt
-    import io
-    from PIL import Image
-    
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    
-    # 收集样本
-    depth_samples = []
-    min_depths = []
-    front_depths = []
-    
-    state, _ = env.reset()
-    for _ in range(500):
-        depth = state[config.base_state_dim:]
-        depth_samples.append(depth.copy())
-        min_depths.append(depth.min())
-        mid = len(depth) // 2
-        front_depths.append(np.mean(depth[mid-1:mid+2]))
-        
-        action = env.action_space.sample()
-        state, _, terminated, truncated, _ = env.step(action)
-        if terminated or truncated:
-            state, _ = env.reset()
-    
-    depth_samples = np.array(depth_samples)
-    min_depths = np.array(min_depths)
-    front_depths = np.array(front_depths)
-    
-    # 为每层编码器生成图 (Level 0 是 MPC，从 Level 1 开始)
-    for level in range(1, agent.k_level):
-        policy = agent.HAC[level]
-        encoder = getattr(policy, 'depth_encoder', None)
-        if encoder is None:
-            continue
-        
-        # 计算 embeddings
-        with torch.no_grad():
-            depth_tensor = torch.FloatTensor(depth_samples).to(device)
-            embeddings = encoder(depth_tensor).cpu().numpy()
-        
-        embed_dim = embeddings.shape[1]
-        
-        # 创建散点图
-        fig, axes = plt.subplots(2, embed_dim, figsize=(4*embed_dim, 8))
-        
-        for i in range(embed_dim):
-            # 上行: vs Min Depth
-            axes[0, i].scatter(min_depths, embeddings[:, i], alpha=0.3, s=5, c='steelblue')
-            corr_min = np.corrcoef(embeddings[:, i], min_depths)[0, 1]
-            if np.isnan(corr_min):
-                corr_min = 0.0
-            axes[0, i].set_xlabel('Min Depth')
-            axes[0, i].set_ylabel(f'Embed Dim {i}')
-            axes[0, i].set_title(f'Dim {i} vs Min Depth (r={corr_min:.2f})')
-            
-            # 下行: vs Front Depth
-            axes[1, i].scatter(front_depths, embeddings[:, i], alpha=0.3, s=5, c='steelblue')
-            corr_front = np.corrcoef(embeddings[:, i], front_depths)[0, 1]
-            if np.isnan(corr_front):
-                corr_front = 0.0
-            axes[1, i].set_xlabel('Front Depth')
-            axes[1, i].set_ylabel(f'Embed Dim {i}')
-            axes[1, i].set_title(f'Dim {i} vs Front Depth (r={corr_front:.2f})')
-        
-        plt.suptitle(f'Level {level} Encoder (Episode {episode})', fontsize=14)
-        plt.tight_layout()
-        
-        # 转换为 TensorBoard 图片
-        buf = io.BytesIO()
-        fig.savefig(buf, format='png', dpi=100)
-        buf.seek(0)
-        image = Image.open(buf)
-        image_array = np.array(image)
-        plt.close(fig)
-        
-        # 记录到 TensorBoard (HWC -> CHW)
-        image_tensor = torch.from_numpy(image_array[:, :, :3]).permute(2, 0, 1)
-        writer.add_image(f'Encoder/Level_{level}_Correlation', image_tensor, episode)
+    print("\n" + "=" * 60)
+    print("  Training Completed!")
+    print(f"  Best Reward: {best_reward:.2f}")
+    print(f"  E2E Updates: {len(e2e_losses)}")
+    if e2e_losses:
+        print(f"  Final E2E Dist: {e2e_losses[-1]:.2f}")
+    print("=" * 60)
 
 
 if __name__ == '__main__':

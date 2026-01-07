@@ -121,6 +121,8 @@ class Navigation2DObstacleConfig(BaseConfig):
         self.base_state_dim = 5            # 基础状态维度 [x,y,θ,v,ω]
         self.depth_dim = self.depth_rays   # 深度维度
         self.embedding_dim = 4             # 嵌入维度 (4D 足够表征障碍物方向+距离)
+        # 编码器训练模式: 'rl' = 只RL更新, 'e2e' = 只E2E更新, 'both' = 两者都更新
+        self.encoder_train_mode = 'e2e'
         
         # ==================== 状态空间配置 ====================
         self.state_dim = 5 + self.depth_rays  # 21维
@@ -180,7 +182,7 @@ class Navigation2DObstacleConfig(BaseConfig):
         self.sac_alpha_lr = None           # None = 使用 lr
         
         # ==================== MPC 参数 ====================
-        self.mpc_horizon = 10              # MPC 预测步长
+        self.mpc_horizon = 7              # MPC 预测步长
         self.mpc_iterations = 5            # MPC 优化迭代次数
         self.mpc_lr = 0.5                  # MPC 优化学习率
         self.mpc_Q = [10.0, 10.0]          # 位置误差权重

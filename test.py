@@ -80,16 +80,24 @@ def test(args):
     if args.model:
         model_name = args.model
     else:
-        # 优先尝试 solved 版本
-        solved_name = config.get_filename() + '_solved'
+        # 优先尝试 best 版本，其次 solved，最后默认
         import os
+        base_name = config.get_filename()
+        best_name = base_name + '_best'
+        solved_name = base_name + '_solved'
+        
         # Level 1 是第一个需要加载的策略
+        best_path = os.path.join(model_dir, f"{best_name}_level_1_actor.pth")
         solved_path = os.path.join(model_dir, f"{solved_name}_level_1_actor.pth")
-        if os.path.exists(solved_path):
+        
+        if os.path.exists(best_path):
+            model_name = best_name
+            print("Found best model, loading it...")
+        elif os.path.exists(solved_path):
             model_name = solved_name
             print("Found solved model, loading it...")
         else:
-            model_name = config.get_filename()
+            model_name = base_name
     
     print(f"Loading model from: {model_dir}{model_name}")
     agent.load(model_dir, model_name)

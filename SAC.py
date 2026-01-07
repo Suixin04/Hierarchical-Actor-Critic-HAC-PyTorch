@@ -101,20 +101,24 @@ class GaussianActor(nn.Module):
         self.register_buffer('action_scale', action_bounds.flatten())
         self.register_buffer('action_offset', action_offset.flatten())
     
-    def _encode_state(self, state: torch.Tensor) -> torch.Tensor:
-        """编码状态（如果有深度编码器）"""
+    def _encode_state(self, state: torch.Tensor, detach_encoder: bool = False) -> torch.Tensor:
+        """编码状态
+        
+        Args:
+            state: 输入状态
+            detach_encoder: 是否 detach encoder 输出 (阻断梯度流向 encoder)
+        """
         if self.depth_encoder is not None:
-            # 分离基础状态和深度
             base_state = state[:, :self.base_state_dim]
             depth = state[:, self.base_state_dim:]
-            # 编码深度
             depth_embedding = self.depth_encoder(depth)
-            # 拼接
+            if detach_encoder:
+                depth_embedding = depth_embedding.detach()  # 阻断梯度流向 encoder
             return torch.cat([base_state, depth_embedding], dim=1)
         return state
         
-    def forward(self, state: torch.Tensor, goal: torch.Tensor):
-        encoded_state = self._encode_state(state)
+    def forward(self, state: torch.Tensor, goal: torch.Tensor, detach_encoder: bool = False):
+        encoded_state = self._encode_state(state, detach_encoder)
         x = torch.cat([encoded_state, goal], dim=1)
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
@@ -125,9 +129,9 @@ class GaussianActor(nn.Module):
         
         return mean, log_std
     
-    def sample(self, state: torch.Tensor, goal: torch.Tensor):
+    def sample(self, state: torch.Tensor, goal: torch.Tensor, detach_encoder: bool = False):
         """采样动作并计算 log 概率（含 tanh 修正）"""
-        mean, log_std = self.forward(state, goal)
+        mean, log_std = self.forward(state, goal, detach_encoder)
         std = log_std.exp()
         
         # 从高斯分布采样
@@ -150,8 +154,8 @@ class GaussianActor(nn.Module):
         return action, log_prob
     
     def get_action(self, state: torch.Tensor, goal: torch.Tensor, deterministic: bool = False):
-        """获取动作"""
-        mean, log_std = self.forward(state, goal)
+        """获取动作 (不需要梯度，用于推理)"""
+        mean, log_std = self.forward(state, goal, detach_encoder=True)  # 推理时总是 detach
         
         if deterministic:
             # 确定性: 直接用均值
@@ -202,17 +206,24 @@ class SoftQNetwork(nn.Module):
             nn.Sigmoid()
         )
     
-    def _encode_state(self, state: torch.Tensor) -> torch.Tensor:
-        """编码状态（如果有深度编码器）"""
+    def _encode_state(self, state: torch.Tensor, detach_encoder: bool = False) -> torch.Tensor:
+        """编码状态
+        
+        Args:
+            state: 输入状态
+            detach_encoder: 是否 detach encoder 输出 (阻断梯度流向 encoder)
+        """
         if self.depth_encoder is not None:
             base_state = state[:, :self.base_state_dim]
             depth = state[:, self.base_state_dim:]
             depth_embedding = self.depth_encoder(depth)
+            if detach_encoder:
+                depth_embedding = depth_embedding.detach()
             return torch.cat([base_state, depth_embedding], dim=1)
         return state
         
-    def forward(self, state: torch.Tensor, action: torch.Tensor, goal: torch.Tensor):
-        encoded_state = self._encode_state(state)
+    def forward(self, state: torch.Tensor, action: torch.Tensor, goal: torch.Tensor, detach_encoder: bool = False):
+        encoded_state = self._encode_state(state, detach_encoder)
         x = torch.cat([encoded_state, action, goal], dim=1)
         return -self.net(x) * self.H  # [-H, 0]
 
@@ -240,15 +251,17 @@ class SAC:
         hidden_dim: int = 64,
         alpha: float = 0.2,
         auto_entropy: bool = True,
-        target_entropy: float = None,     # None = -action_dim
-        alpha_lr: float = None,           # None = 使用 lr
-        # 独立编码器参数
+        target_entropy: float = None,
+        alpha_lr: float = None,
+        # 深度编码器参数
         use_depth_encoder: bool = False,
         base_state_dim: int = 5,
         depth_dim: int = 16,
         embedding_dim: int = 8,
         depth_max_range: float = 5.0,
-        level: int = 0
+        level: int = 0,
+        # 保留参数兼容性，但不再使用
+        encoder_train_mode: str = 'e2e'
     ):
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -310,7 +323,12 @@ class SAC:
         return action.cpu().numpy().flatten()
     
     def update(self, buffer, n_iter: int, batch_size: int):
-        """更新策略"""
+        """
+        RL 更新策略
+        
+        关键设计: encoder 输出被 detach，确保 RL 只更新 Actor/Critic，
+        不会同时更新 encoder (encoder 只由 E2E 更新)
+        """
         for _ in range(n_iter):
             state, action, reward, next_state, goal, gamma, done = buffer.sample(batch_size)
             
@@ -322,20 +340,18 @@ class SAC:
             gamma = torch.FloatTensor(gamma).reshape(-1, 1).to(device)
             done = torch.FloatTensor(done).reshape(-1, 1).to(device)
             
-            # ===== Critic Update =====
-            # 注意: 当使用共享深度编码器时，Q1 和 Q2 的 loss 需要合并后一起 backward
-            # 避免编码器被多次更新导致梯度不一致
+            # ===== Critic Update (encoder detached) =====
             with torch.no_grad():
-                next_action, next_log_prob = self.actor.sample(next_state, goal)
+                next_action, next_log_prob = self.actor.sample(next_state, goal, detach_encoder=True)
                 q_next = torch.min(
-                    self.q1(next_state, next_action, goal),
-                    self.q2(next_state, next_action, goal)
+                    self.q1(next_state, next_action, goal, detach_encoder=True),
+                    self.q2(next_state, next_action, goal, detach_encoder=True)
                 ) - self.alpha * next_log_prob
                 target_q = reward + (1 - done) * gamma * q_next
             
-            # 合并 Q1 和 Q2 的 loss，一起 backward
-            q1_loss = F.mse_loss(self.q1(state, action, goal), target_q)
-            q2_loss = F.mse_loss(self.q2(state, action, goal), target_q)
+            # Critic forward 时 detach encoder
+            q1_loss = F.mse_loss(self.q1(state, action, goal, detach_encoder=True), target_q)
+            q2_loss = F.mse_loss(self.q2(state, action, goal, detach_encoder=True), target_q)
             critic_loss = q1_loss + q2_loss
             
             self.q1_optimizer.zero_grad()
@@ -344,11 +360,11 @@ class SAC:
             self.q1_optimizer.step()
             self.q2_optimizer.step()
             
-            # ===== Actor Update =====
-            new_action, log_prob = self.actor.sample(state, goal)
+            # ===== Actor Update (encoder detached) =====
+            new_action, log_prob = self.actor.sample(state, goal, detach_encoder=True)
             q_new = torch.min(
-                self.q1(state, new_action, goal),
-                self.q2(state, new_action, goal)
+                self.q1(state, new_action, goal, detach_encoder=True),
+                self.q2(state, new_action, goal, detach_encoder=True)
             )
             actor_loss = (self.alpha * log_prob - q_new).mean()
             

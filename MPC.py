@@ -333,6 +333,7 @@ class DifferentiableMPC(nn.Module):
         Qf: torch.Tensor = None,
         obstacle_weight: float = 10.0,
         safe_distance: float = 0.5,
+        early_stop_tol: float = 1e-3,   # 早停容差
     ):
         super().__init__()
         
@@ -341,6 +342,7 @@ class DifferentiableMPC(nn.Module):
         self.max_a_omega = max_a_omega
         self.num_iterations = num_iterations
         self.lr = lr
+        self.early_stop_tol = early_stop_tol
         
         # 动力学模型
         self.dynamics = DifferentiableDynamics(
@@ -437,7 +439,8 @@ class DifferentiableMPC(nn.Module):
                 torch.zeros(batch_size, 1, 2, device=state.device)
             ], dim=1).clone()
         
-        # 使用简单梯度下降优化
+        # 使用简单梯度下降优化 (带早停)
+        prev_cost = float('inf')
         for iteration in range(self.num_iterations):
             # 创建需要梯度的副本
             actions = actions_data.clone().requires_grad_(True)
@@ -449,6 +452,11 @@ class DifferentiableMPC(nn.Module):
             # 计算代价
             cost = self.cost_fn(states, clipped_actions, goal_detached, obstacles)
             total_cost = cost.sum()
+            
+            # 早停检查: 如果代价变化很小，提前退出
+            if abs(prev_cost - total_cost.item()) < self.early_stop_tol * batch_size:
+                break
+            prev_cost = total_cost.item()
             
             # 计算梯度
             total_cost.backward()
