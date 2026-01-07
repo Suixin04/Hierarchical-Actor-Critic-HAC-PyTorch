@@ -217,7 +217,7 @@ def train(args):
             phase_str = "[P2-RL]"
             e2e_str = ""
         
-        # 安全统计字符串
+        # 安全统计
         safety = agent.get_safety_stats()
         if safety['total'] > 0:
             safety_str = f" Safe:{safety['modified']}/{safety['total']}({100*safety['rate']:.0f}%)"
@@ -229,8 +229,7 @@ def train(args):
         writer.add_scalar('Steps/Episode', agent.timestep, episode)
         writer.add_scalar('Phase', current_phase, episode)
         
-        # 记录安全约束统计
-        safety = agent.get_safety_stats()
+        # 记录安全约束统计 (复用上面获取的 safety)
         if safety['total'] > 0:
             writer.add_scalar('Safety/ModificationRate', safety['rate'], episode)
             writer.add_scalar('Safety/NumModified', safety['modified'], episode)

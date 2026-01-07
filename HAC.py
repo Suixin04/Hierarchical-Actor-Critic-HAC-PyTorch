@@ -332,7 +332,6 @@ class HAC:
                 embedding_dim=self.embedding_dim,
                 depth_max_range=self.depth_max_range,
                 level=level,
-                encoder_train_mode=self.encoder_train_mode
             )
         else:
             return DDPG(
@@ -352,7 +351,6 @@ class HAC:
         
         # ============ 底层 (Level 0): MPC 控制器 ============
         # 使用配置中的 MPC 参数
-        import torch
         Q = torch.FloatTensor(self.mpc_Q)
         R = torch.FloatTensor(self.mpc_R)
         Qf = torch.FloatTensor(self.mpc_Qf)
@@ -417,14 +415,6 @@ class HAC:
             if abs(state_goal[i] - goal[i]) > threshold[i]:
                 return False
         return True
-    
-    def check_any_goal_achieved(self, state: np.ndarray, i_level: int) -> bool:
-        """检查是否达成任何高层目标"""
-        for level in range(i_level, self.k_level):
-            if self.goals[level] is not None:
-                if self.check_goal(state, self.goals[level], self.threshold):
-                    return True
-        return False
     
     def get_prediction_error_feature(self) -> np.ndarray:
         """
@@ -743,13 +733,7 @@ class HAC:
         final_pos = final_positions[-1]
         goal_loss = ((final_pos - goal_t) ** 2).sum(dim=1).mean()
         
-        # 2. 进度损失 (鼓励每一步都接近目标)
-        progress_loss = torch.tensor(0.0, device=device)
-        for t, fp in enumerate(final_positions):
-            weight = 0.3 * (t + 1) / num_steps
-            progress_loss += weight * ((fp - goal_t) ** 2).sum(dim=1).mean()
-        
-        # 3. 避障损失
+        # 2. 避障损失
         obstacle_loss = torch.tensor(0.0, device=device)
         if obstacles is not None and len(obstacles) > 0:
             for fp in final_positions:
@@ -767,7 +751,7 @@ class HAC:
                 violation = torch.relu(margin) ** 2
                 obstacle_loss += 5.0 * violation.sum(dim=1).mean()
         
-        # 4. 控制平滑损失
+        # 3. 控制平滑损失
         smooth_loss = torch.tensor(0.0, device=device)
         if len(all_actions) > 1:
             for t in range(1, len(all_actions)):
@@ -775,7 +759,7 @@ class HAC:
                 smooth_loss += 0.1 * (diff ** 2).sum(dim=1).mean()
         
         # 总损失
-        total_loss = goal_loss + progress_loss + obstacle_loss + smooth_loss
+        total_loss = goal_loss + obstacle_loss + smooth_loss
         
         # ===== 反向传播 =====
         total_loss.backward()
@@ -812,7 +796,6 @@ class HAC:
             'total': final_dist,  # 用最终距离作为主要指标，更易理解
             'loss_value': total_loss.item(),  # 原始 loss 值
             'goal': goal_loss.item(),
-            'progress': progress_loss.item(),
             'obstacle': obstacle_loss.item(),
             'smooth': smooth_loss.item(),
             'final_dist': final_dist,

@@ -260,8 +260,6 @@ class SAC:
         embedding_dim: int = 8,
         depth_max_range: float = 5.0,
         level: int = 0,
-        # 保留参数兼容性，但不再使用
-        encoder_train_mode: str = 'e2e'
     ):
         self.state_dim = state_dim
         self.action_dim = action_dim
