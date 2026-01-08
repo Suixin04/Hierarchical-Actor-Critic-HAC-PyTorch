@@ -196,7 +196,16 @@ def train(args: argparse.Namespace) -> None:
             
             # Phase 1: E2E 预热
             if current_phase == 1:
-                agent.update(config.n_iter, config.batch_size)
+                # 使用带骨架引导的更新（如果有特权信息）
+                if hasattr(env.unwrapped, 'obstacles') and env.unwrapped.obstacles:
+                    skeleton_stats = agent.update_with_skeleton_guidance(
+                        config.n_iter, config.batch_size,
+                        skeleton_weight=1.0,
+                        safe_distance=getattr(config, 'subgoal_safety_margin', 0.5)
+                    )
+                else:
+                    agent.update(config.n_iter, config.batch_size)
+                    skeleton_stats = {}
                 
                 e2e_loss = None
                 if episode % args.e2e_freq == 0:
@@ -209,12 +218,30 @@ def train(args: argparse.Namespace) -> None:
                 
                 phase_str = "[P1-E2E]"
                 e2e_str = f" Dist:{e2e_loss:.2f}" if e2e_loss else ""
+                # 添加骨架损失信息
+                if skeleton_stats and 'level_1' in skeleton_stats:
+                    skel_loss = skeleton_stats['level_1'].get('skeleton_loss', 0)
+                    e2e_str += f" Skel:{skel_loss:.3f}"
             
             # Phase 2: RL 微调
             else:
-                agent.update(config.n_iter, config.batch_size)
+                # 使用带骨架引导的更新（如果有特权信息）
+                if hasattr(env.unwrapped, 'obstacles') and env.unwrapped.obstacles:
+                    skeleton_stats = agent.update_with_skeleton_guidance(
+                        config.n_iter, config.batch_size,
+                        skeleton_weight=0.5,  # Phase 2 降低权重
+                        safe_distance=getattr(config, 'subgoal_safety_margin', 0.5)
+                    )
+                else:
+                    agent.update(config.n_iter, config.batch_size)
+                    skeleton_stats = {}
+                    
                 phase_str = "[P2-RL]"
                 e2e_str = ""
+                # 添加骨架损失信息
+                if skeleton_stats and 'level_1' in skeleton_stats:
+                    skel_loss = skeleton_stats['level_1'].get('skeleton_loss', 0)
+                    e2e_str = f" Skel:{skel_loss:.3f}"
                 e2e_loss = None
             
             # 记录指标
@@ -419,6 +446,10 @@ def test(args: argparse.Namespace) -> None:
     for episode in range(1, args.test_episodes + 1):
         state, _ = env.reset()
         agent.reset()
+        
+        # 注意：测试时不设置障碍物特权信息
+        # 机器人只能依靠深度传感器 + 训练好的 Encoder 来避障
+        # 这是特权学习的关键：训练时用特权信息，测试时只用传感器
         
         # 获取目标
         env_goal = (

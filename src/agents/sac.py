@@ -134,9 +134,12 @@ class SACAgent:
         
         # 编码器优化器 (可选)
         self.encoder_optimizer: Optional[optim.Adam] = None
-        if self.depth_encoder is not None and encoder_train_mode == 'rl':
+        if self.depth_encoder is not None and encoder_train_mode in ['rl', 'finetune']:
+            # 'rl' 模式：正常学习率
+            # 'finetune' 模式：初始化优化器，但后续可通过 setup_encoder_finetune 调整学习率
+            encoder_lr = lr if encoder_train_mode == 'rl' else lr * 0.1  # finetune 用较小学习率
             self.encoder_optimizer = optim.Adam(
-                self.depth_encoder.parameters(), lr=lr
+                self.depth_encoder.parameters(), lr=encoder_lr
             )
     
     def setup_encoder_finetune(self, finetune_lr: float) -> None:
@@ -258,6 +261,179 @@ class SACAgent:
                 alpha_loss.backward()
                 self.alpha_optimizer.step()
                 self.alpha = self.log_alpha.exp().item()
+    
+    def update_with_privileged_loss(
+        self, 
+        buffer: ReplayBuffer, 
+        n_iter: int, 
+        batch_size: int,
+        obstacles: list,
+        skeleton_weight: float = 1.0,
+        safe_distance: float = 0.5
+    ) -> dict:
+        """
+        带特权学习的 RL 更新
+        
+        设计原理 (基于 Actor-Critic 框架):
+        - Critic 负责评估：通过骨架引导损失学会给危险子目标低 Q 值
+        - Encoder 通过 Critic 更新获得梯度：学习"哪里有障碍物"
+        - Actor 通过 max Q 间接学会避障：不直接接收特权信息
+        
+        这样的设计：
+        1. 不与 SAC 的最大熵目标冲突
+        2. 更符合 RL 的 Actor-Critic 原理
+        3. 避免直接约束 Actor 导致探索受限
+        
+        Args:
+            buffer: 经验缓冲区
+            n_iter: 迭代次数
+            batch_size: 批大小
+            obstacles: 障碍物列表 [(x, y, radius), ...]
+            skeleton_weight: 骨架引导损失权重
+            safe_distance: 安全距离
+            
+        Returns:
+            训练统计信息
+        """
+        if len(buffer) < batch_size:
+            return {'skeleton_loss': 0.0}
+        
+        # Critic 更新时不 detach encoder，让梯度流过
+        # Actor 更新时 detach encoder，只通过 Q 值间接影响
+        
+        total_skeleton_loss = 0.0
+        
+        for _ in range(n_iter):
+            # 采样
+            states, actions, rewards, next_states, goals, gammas, dones = buffer.sample(batch_size)
+            
+            states = to_tensor(states)
+            actions = to_tensor(actions)
+            rewards = to_tensor(rewards).unsqueeze(1)
+            next_states = to_tensor(next_states)
+            goals = to_tensor(goals)
+            gammas = to_tensor(gammas).unsqueeze(1)
+            dones = to_tensor(dones).unsqueeze(1)
+            
+            # ===== Critic Update with Skeleton Guidance =====
+            # 特权信息通过 Critic 更新流向 Encoder
+            with torch.no_grad():
+                next_action, next_log_prob = self.actor.sample(
+                    next_states, goals, detach_encoder=True
+                )
+                q_next = self.critic(
+                    next_states, next_action, goals, detach_encoder=True
+                )
+                target_q = rewards + (1 - dones) * gammas * (q_next - self.alpha * next_log_prob)
+            
+            # Critic 前向传播：不 detach encoder，让梯度流过
+            q_pred = self.critic(states, actions, goals, detach_encoder=False)
+            q_loss = F.mse_loss(q_pred, target_q)
+            
+            # 骨架引导损失：惩罚 Critic 对危险子目标的高估
+            # 这让 Critic 学会给危险子目标低 Q 值
+            skeleton_loss = self._compute_critic_skeleton_loss(
+                states, actions, goals, obstacles, safe_distance
+            )
+            
+            critic_total_loss = q_loss + skeleton_weight * skeleton_loss
+            total_skeleton_loss += skeleton_loss.item()
+            
+            self.critic_optimizer.zero_grad()
+            if self.encoder_optimizer is not None:
+                self.encoder_optimizer.zero_grad()
+            
+            critic_total_loss.backward()
+            
+            self.critic_optimizer.step()
+            if self.encoder_optimizer is not None:
+                self.encoder_optimizer.step()
+            
+            # ===== Actor Update (标准 SAC，通过 Q 值间接学习) =====
+            # Actor 不直接接收特权信息，而是通过 max Q 学习
+            new_action, log_prob = self.actor.sample(
+                states, goals, detach_encoder=True  # detach encoder
+            )
+            q_new = self.critic(
+                states, new_action, goals, detach_encoder=True  # detach encoder
+            )
+            
+            actor_loss = (self.alpha * log_prob - q_new).mean()
+            
+            self.actor_optimizer.zero_grad()
+            actor_loss.backward()
+            self.actor_optimizer.step()
+            
+            # ===== Entropy Update =====
+            if self.auto_entropy:
+                alpha_loss = -(
+                    self.log_alpha * (log_prob + self.target_entropy).detach()
+                ).mean()
+                self.alpha_optimizer.zero_grad()
+                alpha_loss.backward()
+                self.alpha_optimizer.step()
+                self.alpha = self.log_alpha.exp().item()
+        
+        return {'skeleton_loss': total_skeleton_loss / max(n_iter, 1)}
+    
+    def _compute_critic_skeleton_loss(
+        self,
+        states: torch.Tensor,
+        actions: torch.Tensor,
+        goals: torch.Tensor,
+        obstacles: list,
+        safe_distance: float = 0.5
+    ) -> torch.Tensor:
+        """
+        计算 Critic 的骨架引导损失 (改进版)
+        
+        原理：让 Critic 学会给危险子目标（靠近障碍物）低 Q 值
+        
+        改进：不使用 (Q + H) 作为因子，因为 Bounded Q 容易饱和导致梯度消失
+        改为直接用 MSE 将危险子目标的 Q 值推向 -H
+        
+        Args:
+            states: 状态 [batch, state_dim]
+            actions: 动作/子目标 [batch, action_dim]
+            goals: 目标 [batch, goal_dim]
+            obstacles: 障碍物列表
+            safe_distance: 安全距离
+            
+        Returns:
+            骨架引导损失
+        """
+        if not obstacles:
+            return torch.tensor(0.0, device=self._device)
+        
+        # 计算当前 Q 值
+        q_pred = self.critic(states, actions, goals, detach_encoder=False)
+        
+        # 计算子目标的危险程度 (0 = 安全, >0 = 危险)
+        danger_score = torch.zeros(actions.shape[0], device=self._device)
+        
+        for ox, oy, orad in obstacles:
+            center = torch.tensor([ox, oy], device=self._device, dtype=torch.float32)
+            dist_to_obs = torch.norm(actions[:, :2] - center, dim=1)
+            min_safe = orad + safe_distance
+            
+            # 危险程度：越近越危险，使用 softplus 平滑
+            danger = F.softplus(min_safe - dist_to_obs, beta=5.0)
+            danger_score = danger_score + danger
+        
+        # 改进的损失计算：
+        # 1. 对于危险子目标 (danger > 0)，将 Q 值推向 -H
+        # 2. 使用 MSE 损失，避免 (Q+H) 饱和问题
+        # 3. danger_score 作为权重，越危险惩罚越大
+        
+        # 目标 Q 值：危险子目标应该是 -H
+        target_q_for_danger = torch.full_like(q_pred, -self.H)
+        
+        # 加权 MSE：只惩罚危险的子目标
+        # 当 danger_score = 0 时，损失 = 0
+        # 当 danger_score > 0 时，将 Q 推向 -H
+        loss = (danger_score * (q_pred.squeeze() - target_q_for_danger.squeeze()) ** 2).mean()
+        
+        return loss
     
     def save(self, directory: str, name: str) -> None:
         """保存模型"""

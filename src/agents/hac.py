@@ -347,6 +347,99 @@ class HACAgent:
         """设置障碍物 (特权学习)"""
         self.privileged_obstacles = obstacles
     
+    def repel_subgoal_from_obstacles(
+        self,
+        subgoal: np.ndarray,
+        agent_pos: np.ndarray,
+        safety_margin: float = 0.5
+    ) -> Tuple[np.ndarray, bool]:
+        """
+        基于 SGS-Planner 的球体膨胀思想，将子目标推离障碍物
+        
+        类似 SGS-Planner 的骨架提取：将点沿远离障碍物方向"推"到安全区域
+        
+        Args:
+            subgoal: 原始子目标 [x, y]
+            agent_pos: 机器人当前位置 [x, y]
+            safety_margin: 安全裕量
+            
+        Returns:
+            (推后的子目标, 是否发生了推移)
+        """
+        if not self.privileged_obstacles:
+            return subgoal, False
+        
+        repelled = subgoal.copy()
+        was_repelled = False
+        agent_radius = getattr(self.config, 'agent_radius', 0.2)
+        total_safe_dist = safety_margin + agent_radius
+        
+        # 迭代推离，最多 5 次（防止多个障碍物相互影响）
+        for _ in range(5):
+            repelled_this_iter = False
+            
+            for ox, oy, orad in self.privileged_obstacles:
+                obs_center = np.array([ox, oy])
+                to_subgoal = repelled - obs_center
+                dist = np.linalg.norm(to_subgoal)
+                
+                min_safe_dist = orad + total_safe_dist
+                
+                if dist < min_safe_dist:
+                    if dist < 1e-6:
+                        # 子目标正好在障碍物中心，用 agent->subgoal 方向
+                        direction = repelled - agent_pos
+                        if np.linalg.norm(direction) < 1e-6:
+                            # 极端情况：随机方向
+                            direction = np.array([1.0, 0.0])
+                        direction = direction / np.linalg.norm(direction)
+                    else:
+                        # 沿远离障碍物方向推
+                        direction = to_subgoal / dist
+                    
+                    # 推到安全距离外
+                    repelled = obs_center + direction * min_safe_dist
+                    was_repelled = True
+                    repelled_this_iter = True
+            
+            if not repelled_this_iter:
+                break
+        
+        # 边界约束
+        margin = self.boundary_margin
+        world_size = self.config.world_size
+        repelled = np.clip(repelled, margin, world_size - margin)
+        
+        return repelled, was_repelled
+    
+    def find_safest_direction(
+        self,
+        state: np.ndarray,
+        num_candidates: int = 8
+    ) -> Tuple[float, float]:
+        """
+        找到最安全的方向（最大间隙方向）
+        
+        类似 SGS-Planner 的骨架引导：找到远离所有障碍物的方向
+        
+        Args:
+            state: 当前状态
+            num_candidates: 候选方向数量
+            
+        Returns:
+            (最安全方向的角度, 该方向的深度)
+        """
+        depth_readings = state[self.base_state_dim:]
+        agent_theta = state[2]
+        
+        # 找最大深度对应的方向
+        ray_angles = np.linspace(-self.depth_fov/2, self.depth_fov/2, self.depth_rays)
+        max_idx = np.argmax(depth_readings)
+        max_depth = depth_readings[max_idx]
+        best_rel_angle = ray_angles[max_idx]
+        
+        return best_rel_angle, max_depth
+
     def run_HAC(
         self,
         env,
@@ -414,18 +507,55 @@ class HACAgent:
         policy = self.policies[level]
         
         # 选择子目标
-        subgoal = policy.select_action(state, goal, deterministic=is_subgoal_test)
+        subgoal_original = policy.select_action(state, goal, deterministic=is_subgoal_test)
         
         # 边界裁剪
         subgoal = np.clip(
-            subgoal,
+            subgoal_original,
             [self.boundary_margin, self.boundary_margin],
             [self.config.world_size - self.boundary_margin] * 2
         )
         
+        # 保存深度约束前的子目标（用于 Hindsight Action）
+        subgoal_before_repel = subgoal.copy()
+        was_repelled = False
+        
         # Level 1: 深度约束
         if level == 1 and self.level1_use_polar:
             subgoal = self.apply_depth_constraint(state, subgoal)
+        
+        # Level 1: 障碍物推子目标 (使用特权信息)
+        if level == 1 and self.privileged_obstacles:
+            agent_pos = state[:2]
+            subgoal, was_repelled = self.repel_subgoal_from_obstacles(
+                subgoal, agent_pos, safety_margin=self.subgoal_safety_margin
+            )
+            
+            # 如果子目标被推移，检查是否在正前方被阻挡 -> 寻找最安全方向
+            if was_repelled:
+                # 检查推后的子目标是否太近（说明正前方阻塞严重）
+                dist_to_subgoal = np.linalg.norm(subgoal - agent_pos)
+                if dist_to_subgoal < self.subgoal_r_min * 1.5:
+                    # 正前方严重阻塞，转向最安全方向
+                    best_angle, best_depth = self.find_safest_direction(state)
+                    agent_theta = state[2]
+                    
+                    # 在最安全方向上设置子目标
+                    safe_r = min(best_depth - self.subgoal_safety_margin, self.subgoal_r_max)
+                    safe_r = max(safe_r, self.subgoal_r_min)
+                    
+                    theta_world = agent_theta + best_angle
+                    subgoal = agent_pos + np.array([
+                        safe_r * np.cos(theta_world),
+                        safe_r * np.sin(theta_world)
+                    ])
+                    
+                    # 再次边界约束
+                    subgoal = np.clip(
+                        subgoal,
+                        [self.boundary_margin, self.boundary_margin],
+                        [self.config.world_size - self.boundary_margin] * 2
+                    )
         
         # Level 1: MPC 可达性预测
         if level == 1:
@@ -446,6 +576,13 @@ class HACAgent:
                     self.buffers[level].add((
                         state, subgoal, -self.H, next_state, goal, 0.0, float(done)
                     ))
+            
+            # Hindsight Action 转换：如果子目标被推移，添加两个版本
+            if was_repelled:
+                self._add_hindsight_action_transitions(
+                    level, state, subgoal_before_repel, subgoal, 
+                    next_state, goal, done
+                )
             
             action = self.extract_goal_state(next_state)
         
@@ -523,6 +660,56 @@ class HACAgent:
             transition[4] = hindsight_goal
             self.buffers[level].add(tuple(transition))
     
+    def _add_hindsight_action_transitions(
+        self,
+        level: int,
+        state: np.ndarray,
+        original_subgoal: np.ndarray,
+        repelled_subgoal: np.ndarray,
+        next_state: np.ndarray,
+        goal: np.ndarray,
+        done: bool
+    ) -> None:
+        """
+        添加 Hindsight Action 转换 (HAT)
+        
+        基于 SGS-Planner 的障碍物推子目标思想：
+        - 原始子目标可能不安全
+        - 推后的子目标更安全
+        - 两个版本都加入经验池，但推后的版本有更好的奖励信号
+        
+        Args:
+            level: 层级
+            state: 当前状态
+            original_subgoal: 原始子目标
+            repelled_subgoal: 推后的子目标
+            next_state: 下一状态
+            goal: 最终目标
+            done: 是否结束
+        """
+        if self.buffers[level] is None:
+            return
+        
+        # 检查推后的子目标是否真的不同
+        if np.allclose(original_subgoal, repelled_subgoal, atol=0.05):
+            return
+        
+        # 原始子目标 -> 可能不安全，给予较小的奖励
+        # (标准转换已在 _store_transition 中添加)
+        
+        # 推后的子目标 -> 更安全，作为 hindsight action
+        # 如果达到了推后的子目标，奖励为 0，否则为 -1
+        repelled_achieved = self.check_goal(next_state, repelled_subgoal, self.threshold)
+        
+        if repelled_achieved:
+            self.buffers[level].add((
+                state, repelled_subgoal, 0.0, next_state, goal, 0.0, float(done)
+            ))
+        else:
+            self.buffers[level].add((
+                state, repelled_subgoal, -1.0, next_state, goal, self.gamma, float(done)
+            ))
+    
     # ==================== 训练方法 ====================
     
     def update(self, n_iter: int, batch_size: int) -> None:
@@ -530,6 +717,52 @@ class HACAgent:
         for i in range(1, self.k_level):
             if self.buffers[i] is not None and len(self.buffers[i]) > batch_size:
                 self.policies[i].update(self.buffers[i], n_iter, batch_size)
+    
+    def update_with_skeleton_guidance(
+        self, 
+        n_iter: int, 
+        batch_size: int,
+        skeleton_weight: float = 1.0,
+        safe_distance: float = 0.5
+    ) -> dict:
+        """
+        带骨架引导的策略更新
+        
+        基于 SGS-Planner 的思想：
+        - 骨架引导代价鼓励子目标远离障碍物
+        - 通过特权信息（障碍物位置）提供梯度
+        
+        Args:
+            n_iter: 迭代次数
+            batch_size: 批大小
+            skeleton_weight: 骨架引导损失权重
+            safe_distance: 安全距离
+            
+        Returns:
+            训练统计信息
+        """
+        stats = {}
+        
+        for i in range(1, self.k_level):
+            if self.buffers[i] is None or len(self.buffers[i]) <= batch_size:
+                continue
+            
+            # Level 1 使用带特权学习的更新
+            if i == 1 and self.privileged_obstacles:
+                level_stats = self.policies[i].update_with_privileged_loss(
+                    self.buffers[i], 
+                    n_iter, 
+                    batch_size,
+                    obstacles=self.privileged_obstacles,
+                    skeleton_weight=skeleton_weight,
+                    safe_distance=safe_distance
+                )
+                stats[f'level_{i}'] = level_stats
+            else:
+                # 其他层使用标准更新
+                self.policies[i].update(self.buffers[i], n_iter, batch_size)
+        
+        return stats
     
     def enable_level1_encoder_finetune(
         self, 
@@ -606,6 +839,35 @@ class HACAgent:
                 # Level 1: 深度约束
                 if level == 1 and self.level1_use_polar:
                     subgoal = self.apply_depth_constraint(state, subgoal)
+                
+                # Level 1: 障碍物推子目标 (使用特权信息)
+                if level == 1 and self.privileged_obstacles:
+                    agent_pos = state[:2]
+                    subgoal, was_repelled = self.repel_subgoal_from_obstacles(
+                        subgoal, agent_pos, safety_margin=self.subgoal_safety_margin
+                    )
+                    
+                    # 如果被推移且距离太近，转向最安全方向
+                    if was_repelled:
+                        dist_to_subgoal = np.linalg.norm(subgoal - agent_pos)
+                        if dist_to_subgoal < self.subgoal_r_min * 1.5:
+                            best_angle, best_depth = self.find_safest_direction(state)
+                            agent_theta = state[2]
+                            
+                            safe_r = min(best_depth - self.subgoal_safety_margin, self.subgoal_r_max)
+                            safe_r = max(safe_r, self.subgoal_r_min)
+                            
+                            theta_world = agent_theta + best_angle
+                            subgoal = agent_pos + np.array([
+                                safe_r * np.cos(theta_world),
+                                safe_r * np.sin(theta_world)
+                            ])
+                            
+                            subgoal = np.clip(
+                                subgoal,
+                                [self.boundary_margin, self.boundary_margin],
+                                [self.config.world_size - self.boundary_margin] * 2
+                            )
                 
                 # 递归调用下一层
                 next_state, done = self.run_HAC_inference(env, level - 1, state, subgoal)
@@ -690,6 +952,35 @@ class HACAgent:
                 # Level 1: 深度约束
                 if level == 1 and self.level1_use_polar:
                     new_subgoal = self.apply_depth_constraint(state, new_subgoal)
+                
+                # Level 1: 障碍物推子目标 (使用特权信息)
+                if level == 1 and self.privileged_obstacles:
+                    agent_pos = state[:2]
+                    new_subgoal, was_repelled = self.repel_subgoal_from_obstacles(
+                        new_subgoal, agent_pos, safety_margin=self.subgoal_safety_margin
+                    )
+                    
+                    # 如果被推移且距离太近，转向最安全方向
+                    if was_repelled:
+                        dist_to_subgoal = np.linalg.norm(new_subgoal - agent_pos)
+                        if dist_to_subgoal < self.subgoal_r_min * 1.5:
+                            best_angle, best_depth = self.find_safest_direction(state)
+                            agent_theta = state[2]
+                            
+                            safe_r = min(best_depth - self.subgoal_safety_margin, self.subgoal_r_max)
+                            safe_r = max(safe_r, self.subgoal_r_min)
+                            
+                            theta_world = agent_theta + best_angle
+                            new_subgoal = agent_pos + np.array([
+                                safe_r * np.cos(theta_world),
+                                safe_r * np.sin(theta_world)
+                            ])
+                            
+                            new_subgoal = np.clip(
+                                new_subgoal,
+                                [self.boundary_margin, self.boundary_margin],
+                                [self.config.world_size - self.boundary_margin] * 2
+                            )
                 
                 # 设置下一层的目标
                 self.goals[level - 1] = new_subgoal
