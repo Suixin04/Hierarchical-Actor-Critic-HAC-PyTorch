@@ -123,7 +123,9 @@ class SACAgent:
         self.auto_entropy = auto_entropy
         if auto_entropy:
             self.target_entropy = target_entropy if target_entropy is not None else -action_dim
-            self.log_alpha = torch.zeros(1, requires_grad=True, device=self._device)
+            # 使用配置的初始 alpha 值，而不是默认的 1.0
+            init_log_alpha = np.log(alpha) if alpha > 0 else 0.0
+            self.log_alpha = torch.tensor([init_log_alpha], requires_grad=True, device=self._device)
             _alpha_lr = alpha_lr if alpha_lr is not None else lr
             self.alpha_optimizer = optim.Adam([self.log_alpha], lr=_alpha_lr)
             self.alpha = self.log_alpha.exp().item()

@@ -180,11 +180,14 @@ def train(args: argparse.Namespace) -> None:
             if hasattr(env.unwrapped, 'obstacles'):
                 agent.set_obstacles(env.unwrapped.obstacles)
             
-            env_goal = (
-                env.unwrapped.goal_pos 
-                if hasattr(env.unwrapped, 'goal_pos') 
-                else config.goal_state
-            )
+            # 构造 4D 环境目标: [x, y, v, θ]
+            if hasattr(env.unwrapped, 'goal_pos'):
+                goal_pos = env.unwrapped.goal_pos
+                goal_theta = getattr(env.unwrapped, 'goal_theta', 0.0)
+                # 4D 目标: 位置 + 到达时速度=0 + 朝向
+                env_goal = np.array([goal_pos[0], goal_pos[1], 0.0, goal_theta])
+            else:
+                env_goal = config.goal_state
             
             last_state, done = agent.run_HAC(
                 env, config.k_level - 1, state, env_goal, is_subgoal_test=False
@@ -412,43 +415,39 @@ def test(args: argparse.Namespace) -> None:
     steps_list = []
     success_count = 0
     
-    # 计算最大步数
-    max_steps = config.H ** config.k_level
-    
     print("\n" + "-" * 40)
-    print("Running test episodes...")
+    print("Running test episodes (using run_HAC_inference)...")
     print("-" * 40)
     
     for episode in range(1, args.test_episodes + 1):
         state, _ = env.reset()
         agent.reset()
         
-        # 获取并设置目标
-        env_goal = (
-            env.unwrapped.goal_pos 
-            if hasattr(env.unwrapped, 'goal_pos') 
-            else config.goal_state
+        # 构造 4D 环境目标: [x, y, v, θ]
+        if hasattr(env.unwrapped, 'goal_pos'):
+            goal_pos = env.unwrapped.goal_pos
+            goal_theta = getattr(env.unwrapped, 'goal_theta', 0.0)
+            env_goal = np.array([goal_pos[0], goal_pos[1], 0.0, goal_theta])
+        else:
+            env_goal = config.goal_state
+        
+        # 使用官方风格的递归执行
+        # 参考: https://github.com/nikhilbarhate99/Hierarchical-Actor-Critic-HAC-PyTorch
+        final_state, done = agent.run_HAC_inference(
+            env, 
+            agent.k_level - 1,  # 从最高层开始
+            state, 
+            env_goal
         )
-        agent.set_goal(env_goal)
         
-        done = False
-        total_reward = 0.0
-        total_steps = 0
-        
-        while not done and total_steps < max_steps:
-            action = agent.act(state, deterministic=True)
-            next_state, reward, terminated, truncated, info = env.step(action)
-            done = terminated or truncated
-            
-            total_reward += reward
-            total_steps += 1
-            state = next_state
+        total_reward = agent.reward
+        total_steps = agent.timestep
         
         rewards.append(total_reward)
         steps_list.append(total_steps)
         
         # 检查是否成功
-        success = agent.check_goal(state, env_goal, config.goal_threshold)
+        success = agent.check_goal(final_state, env_goal, config.goal_threshold)
         if success:
             success_count += 1
             success_str = " [SUCCESS]"

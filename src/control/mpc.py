@@ -1,6 +1,7 @@
 """可微模型预测控制器
 
 通过梯度下降优化控制序列，支持:
+- 4D 目标: (x, y, v_desired, θ_desired)
 - 暖启动 (使用上一次的解作为初始值)
 - 早停 (代价变化小于阈值时提前退出)
 - 端到端训练 (梯度可回传到目标)
@@ -20,7 +21,7 @@ class DifferentiableMPC(nn.Module):
     """
     可微 MPC 控制器
     
-    通过梯度下降优化控制序列。
+    通过梯度下降优化控制序列，支持 4D 目标。
     
     Args:
         horizon: 预测步长
@@ -33,7 +34,9 @@ class DifferentiableMPC(nn.Module):
         damping_omega: 角速度阻尼
         num_iterations: 优化迭代次数
         lr: 优化学习率
-        Q, R, Qf: 代价函数权重
+        Q_pos, Q_vel, Q_theta: 阶段代价权重
+        R: 控制代价权重
+        Qf_pos, Qf_vel, Qf_theta: 终端代价权重
         early_stop_tol: 早停容差
     """
     
@@ -49,8 +52,16 @@ class DifferentiableMPC(nn.Module):
         damping_omega: float = 0.9,
         num_iterations: int = 5,
         lr: float = 0.5,
-        Q: Optional[torch.Tensor] = None,
+        # 4D 代价权重
+        Q_pos: Optional[torch.Tensor] = None,
+        Q_vel: float = 5.0,
+        Q_theta: float = 2.0,
         R: Optional[torch.Tensor] = None,
+        Qf_pos: Optional[torch.Tensor] = None,
+        Qf_vel: float = 10.0,
+        Qf_theta: float = 5.0,
+        # 兼容旧接口
+        Q: Optional[torch.Tensor] = None,
         Qf: Optional[torch.Tensor] = None,
         early_stop_tol: float = 1e-3,
     ):
@@ -72,8 +83,16 @@ class DifferentiableMPC(nn.Module):
             damping_omega=damping_omega
         )
         
-        # 代价函数
-        self.cost_fn = MPCCost(Q=Q, R=R, Qf=Qf)
+        # 代价函数 (支持 4D 目标)
+        self.cost_fn = MPCCost(
+            Q_pos=Q_pos if Q_pos is not None else Q,
+            Q_vel=Q_vel,
+            Q_theta=Q_theta,
+            R=R,
+            Qf_pos=Qf_pos if Qf_pos is not None else Qf,
+            Qf_vel=Qf_vel,
+            Qf_theta=Qf_theta,
+        )
         
         # 暖启动缓存
         self._prev_actions: Optional[torch.Tensor] = None
@@ -116,7 +135,7 @@ class DifferentiableMPC(nn.Module):
         
         Args:
             state: [batch, state_dim] 当前状态 (只用前5维)
-            goal: [batch, 2] 目标位置
+            goal: [batch, 2] 或 [batch, 4] 目标 (位置 或 位置+速度+朝向)
             return_trajectory: 是否返回预测轨迹
             
         Returns:
@@ -246,11 +265,12 @@ class MPCController:
     MPC 控制器包装类
     
     提供与 RL 智能体相同的接口，用于 HAC 底层。
+    支持 4D 目标: (x, y, v_desired, θ_desired)
     
     Args:
         state_dim: 状态维度
         action_dim: 动作维度  
-        goal_dim: 目标维度
+        goal_dim: 目标维度 (2 或 4)
         horizon: 预测步长
         **kwargs: 其他 MPC 参数
     """
@@ -282,7 +302,7 @@ class MPCController:
         
         Args:
             state: 状态
-            goal: 子目标 [x, y]
+            goal: 子目标 [x, y] 或 [x, y, v, θ]
             deterministic: MPC 本身是确定性的
             
         Returns:
@@ -305,23 +325,35 @@ class MPCController:
         
         Args:
             state: 当前状态
-            goal: 子目标位置
-            threshold: 可达性阈值
+            goal: 子目标 [x, y] 或 [x, y, v, θ]
+            threshold: 可达性阈值 (位置)
             
         Returns:
             is_reachable: 是否可达
-            distance: 预测最终距离
-            final_pos: 预测最终位置
+            distance: 预测最终位置距离
+            pred_goal_4d: 预测的 4D 终端目标 [x, y, v, θ]
         """
         state_t = torch.FloatTensor(state.reshape(1, -1)).to(self._device)
-        goal_t = torch.FloatTensor(goal[:2].reshape(1, -1)).to(self._device)
+        goal_t = torch.FloatTensor(goal.reshape(1, -1)).to(self._device)
         
         _, _, info = self.mpc(state_t, goal_t, return_trajectory=True)
         trajectory = info['predicted_trajectory']
-        final_pos = trajectory[0, -1, :2].detach().cpu().numpy()
         
-        distance = np.linalg.norm(final_pos - goal[:2])
-        return distance <= threshold, distance, final_pos
+        # 提取预测的终端状态: [x, y, θ, v, ω]
+        final_state = trajectory[0, -1, :5].detach().cpu().numpy()
+        
+        # 构造 4D 预测目标: [x, y, v, θ]
+        pred_goal_4d = np.array([
+            final_state[0],  # x
+            final_state[1],  # y
+            final_state[3],  # v (状态中是 index 3)
+            final_state[2],  # θ (状态中是 index 2)
+        ])
+        
+        # 位置可达性判断
+        goal_pos = goal[:2]
+        distance = np.linalg.norm(pred_goal_4d[:2] - goal_pos)
+        return distance <= threshold, distance, pred_goal_4d
     
     def update(self, buffer, n_iter: int, batch_size: int) -> None:
         """MPC 不需要学习更新"""

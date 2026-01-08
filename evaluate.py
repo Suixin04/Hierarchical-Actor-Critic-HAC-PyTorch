@@ -119,6 +119,10 @@ def evaluate_model(args):
             next_state, reward, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
             
+            # 渲染
+            if args.render:
+                env.render()
+            
             trajectory.append(next_state[:2].copy())
             total_reward += reward
             total_steps += 1

@@ -80,27 +80,37 @@ class BaseConfig:
     
     @property
     def subgoal_dim(self) -> int:
-        """子目标维度"""
+        """子目标维度 (与 goal_dim 相同)"""
         return self.effective_goal_dim
     
     def extract_goal_from_state(self, state: np.ndarray) -> np.ndarray:
-        """从状态提取目标部分"""
+        """从状态提取目标部分 (4D: x, y, v, θ)"""
         if self.goal_indices is not None:
             return state[self.goal_indices]
         return state
     
     def get_subgoal_bounds(self, level: int = None) -> np.ndarray:
-        """获取子目标边界"""
+        """获取子目标边界 (4D)"""
+        # 优先使用 4D bounds
+        if hasattr(self, 'subgoal_bounds_4d'):
+            return self.subgoal_bounds_4d
+        # 兼容旧的 polar bounds
         if level == 1 and getattr(self, 'level1_use_polar', False):
-            return self.level1_subgoal_bounds
+            if hasattr(self, 'level1_subgoal_bounds'):
+                return self.level1_subgoal_bounds
         if self.goal_indices is not None:
             return self.state_bounds[self.goal_indices]
         return self.state_bounds
     
     def get_subgoal_offset(self, level: int = None) -> np.ndarray:
-        """获取子目标偏移"""
+        """获取子目标偏移 (4D)"""
+        # 优先使用 4D offset
+        if hasattr(self, 'subgoal_offset_4d'):
+            return self.subgoal_offset_4d
+        # 兼容旧的 polar offset
         if level == 1 and getattr(self, 'level1_use_polar', False):
-            return self.level1_subgoal_offset
+            if hasattr(self, 'level1_subgoal_offset'):
+                return self.level1_subgoal_offset
         if self.goal_indices is not None:
             return self.state_offset[self.goal_indices]
         return self.state_offset

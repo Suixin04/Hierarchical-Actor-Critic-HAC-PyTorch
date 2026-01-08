@@ -592,8 +592,38 @@ class Navigation2DEnv(gym.Env):
             pygame.draw.circle(self.screen, color, pos_screen, radius)
             pygame.draw.circle(self.screen, (50, 50, 50), pos_screen, radius, 1)  # 边框
             
-            # 如果目标包含朝向 (第3维)，绘制朝向箭头
-            if len(goal) >= 3:
+            # 如果目标包含速度和朝向 (4D: x, y, v, θ)，用箭头表示
+            # 箭头方向 = 朝向 θ，箭头长度 = 速度 v
+            if len(goal) >= 4:
+                v = goal[2]       # 速度
+                theta = goal[3]   # 朝向
+                # 箭头长度与速度成正比，基础长度 + 速度缩放
+                base_arrow_len = 0.15
+                speed_scale = 0.25  # 速度到长度的缩放因子
+                arrow_len = base_arrow_len + v * speed_scale
+                
+                arrow_end = (
+                    int((goal[0] + np.cos(theta) * arrow_len) * self.scale),
+                    int((self.world_size - (goal[1] + np.sin(theta) * arrow_len)) * self.scale)
+                )
+                # 绘制箭头主干
+                pygame.draw.line(self.screen, color, pos_screen, arrow_end, 2)
+                
+                # 绘制箭头头部 (三角形)
+                arrow_head_size = 4 + i * 1  # 箭头头部大小
+                angle_offset = 2.5  # 箭头张角 (弧度)
+                head_len = arrow_head_size / self.scale
+                head1 = (
+                    int((goal[0] + np.cos(theta) * arrow_len - np.cos(theta - angle_offset) * head_len) * self.scale),
+                    int((self.world_size - (goal[1] + np.sin(theta) * arrow_len - np.sin(theta - angle_offset) * head_len)) * self.scale)
+                )
+                head2 = (
+                    int((goal[0] + np.cos(theta) * arrow_len - np.cos(theta + angle_offset) * head_len) * self.scale),
+                    int((self.world_size - (goal[1] + np.sin(theta) * arrow_len - np.sin(theta + angle_offset) * head_len)) * self.scale)
+                )
+                pygame.draw.polygon(self.screen, color, [arrow_end, head1, head2])
+            elif len(goal) >= 3:
+                # 兼容旧的 3D 目标 (x, y, θ)
                 theta = goal[2]
                 arrow_len = 0.3 + i * 0.1
                 arrow_end = (
