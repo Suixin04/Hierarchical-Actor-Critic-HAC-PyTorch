@@ -61,7 +61,7 @@ class Navigation2DEnv(gym.Env):
         max_a_v: float = 1.0,         # 最大线加速度
         max_a_omega: float = 2.0,     # 最大角加速度
         dt: float = 0.1,
-        num_obstacles: int = 6,
+        num_obstacles: int = 0,
         obstacle_radius_range: Tuple[float, float] = (0.3, 0.8),
         depth_rays: int = 16,
         depth_fov: float = 2 * np.pi,  # 360度
