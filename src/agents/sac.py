@@ -385,15 +385,28 @@ class SACAgent:
         safe_distance: float = 0.5
     ) -> torch.Tensor:
         """
-        计算 Critic 的骨架引导损失 (改进版)
+        计算 Critic 的骨架引导损失 (直接解析梯度版)
         
-        原理：让 Critic 学会给危险子目标（靠近障碍物）低 Q 值
+        核心思想：完全不依赖 TD error，直接用距离信息监督 Critic！
         
-        改进：不使用 (Q + H) 作为因子，因为 Bounded Q 容易饱和导致梯度消失
-        改为直接用 MSE 将危险子目标的 Q 值推向 -H
+        解析公式：
+            Q_target(subgoal) = -H × danger_score(subgoal)
+            
+        其中：
+            danger_score = 1 - sigmoid(scale × (dist - threshold))
+            
+        这是一个纯粹的监督学习问题：
+        - 输入: (state, action=subgoal, goal)
+        - 标签: Q_target = f(dist_to_obstacle)  ← 解析计算！
+        - 损失: MSE(Q_pred, Q_target)
+        
+        梯度流：
+            ∂L/∂θ_encoder = 2(Q - Q_target) × ∂Q/∂θ_encoder
+            
+        这是直接的监督信号，不需要 TD bootstrapping！
         
         Args:
-            states: 状态 [batch, state_dim]
+            states: 状态 [batch, state_dim]  
             actions: 动作/子目标 [batch, action_dim]
             goals: 目标 [batch, goal_dim]
             obstacles: 障碍物列表
@@ -405,33 +418,46 @@ class SACAgent:
         if not obstacles:
             return torch.tensor(0.0, device=self._device)
         
-        # 计算当前 Q 值
-        q_pred = self.critic(states, actions, goals, detach_encoder=False)
+        batch_size = actions.shape[0]
         
-        # 计算子目标的危险程度 (0 = 安全, >0 = 危险)
-        danger_score = torch.zeros(actions.shape[0], device=self._device)
+        # ========== Step 1: 解析计算距离 ==========
+        min_dist_to_obs = torch.full((batch_size,), float('inf'), device=self._device)
         
         for ox, oy, orad in obstacles:
             center = torch.tensor([ox, oy], device=self._device, dtype=torch.float32)
-            dist_to_obs = torch.norm(actions[:, :2] - center, dim=1)
-            min_safe = orad + safe_distance
-            
-            # 危险程度：越近越危险，使用 softplus 平滑
-            danger = F.softplus(min_safe - dist_to_obs, beta=5.0)
-            danger_score = danger_score + danger
+            dist_to_surface = torch.norm(actions[:, :2] - center, dim=1) - orad
+            min_dist_to_obs = torch.min(min_dist_to_obs, dist_to_surface)
         
-        # 改进的损失计算：
-        # 1. 对于危险子目标 (danger > 0)，将 Q 值推向 -H
-        # 2. 使用 MSE 损失，避免 (Q+H) 饱和问题
-        # 3. danger_score 作为权重，越危险惩罚越大
+        # ========== Step 2: 解析计算目标 Q 值 ==========
+        # 使用平滑的映射函数：距离 → Q 值
+        # 
+        # danger_score ∈ [0, 1]:
+        #   - 碰撞/危险区: danger_score ≈ 1
+        #   - 安全区: danger_score ≈ 0
+        #
+        # Q_target = -H × danger_score
+        #   - 危险: Q_target ≈ -H (最低)
+        #   - 安全: Q_target ≈ 0 (最高)
         
-        # 目标 Q 值：危险子目标应该是 -H
-        target_q_for_danger = torch.full_like(q_pred, -self.H)
+        scale = 5.0  # 过渡陡峭程度
+        threshold = safe_distance * 0.5  # 分界点：安全距离的一半
         
-        # 加权 MSE：只惩罚危险的子目标
-        # 当 danger_score = 0 时，损失 = 0
-        # 当 danger_score > 0 时，将 Q 推向 -H
-        loss = (danger_score * (q_pred.squeeze() - target_q_for_danger.squeeze()) ** 2).mean()
+        # danger_score = 1 - sigmoid(...) = sigmoid(-(dist - threshold) × scale)
+        danger_score = torch.sigmoid(-scale * (min_dist_to_obs - threshold))
+        
+        # 解析计算目标 Q：Q_target = -H × danger_score
+        target_q = -self.H * danger_score
+        
+        # 这是监督信号，必须 detach！
+        target_q = target_q.detach()
+        
+        # ========== Step 3: Critic 前向传播 ==========
+        # 关键：不 detach encoder，梯度流向 Encoder
+        q_pred = self.critic(states, actions, goals, detach_encoder=False)
+        
+        # ========== Step 4: 监督损失 ==========
+        # 这是纯粹的监督学习：让 Critic 学会 Q(s,a,g) = f(dist_to_obstacle)
+        loss = F.mse_loss(q_pred.squeeze(), target_q)
         
         return loss
     
