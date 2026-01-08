@@ -259,9 +259,18 @@ class HACAgent:
         # 世界坐标 -> 极坐标
         r, theta_rel = world_to_polar(agent_pos, agent_theta, subgoal)
         
-        # 获取该方向的深度
-        depth = self._get_depth_at_angle(state, theta_rel)
-        r_max_depth = max(depth - self.subgoal_safety_margin, self.subgoal_r_min)
+        # 获取该方向及相邻方向的深度 (考虑机器人宽度)
+        # 取多个方向的最小深度，更保守
+        depth_center = self._get_depth_at_angle(state, theta_rel)
+        depth_left = self._get_depth_at_angle(state, theta_rel + 0.2)
+        depth_right = self._get_depth_at_angle(state, theta_rel - 0.2)
+        depth = min(depth_center, depth_left, depth_right)
+        
+        # 安全裕量需要考虑机器人半径 (agent_radius=0.2)
+        # 深度传感器从机器人中心测量，所以还需要额外减去机器人半径
+        agent_radius = getattr(self.config, 'agent_radius', 0.2)
+        effective_safety_margin = self.subgoal_safety_margin + agent_radius
+        r_max_depth = max(depth - effective_safety_margin, self.subgoal_r_min)
         
         # 边界约束
         r_max_boundary = self._compute_boundary_r_max(agent_pos, agent_theta + theta_rel)

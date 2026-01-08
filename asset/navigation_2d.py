@@ -61,7 +61,7 @@ class Navigation2DEnv(gym.Env):
         max_a_v: float = 1.0,         # 最大线加速度
         max_a_omega: float = 2.0,     # 最大角加速度
         dt: float = 0.1,
-        num_obstacles: int = 0,
+        num_obstacles: int = 6,
         obstacle_radius_range: Tuple[float, float] = (0.3, 0.8),
         depth_rays: int = 16,
         depth_fov: float = 2 * np.pi,  # 360度
@@ -369,10 +369,12 @@ class Navigation2DEnv(gym.Env):
         
         # 检测障碍物碰撞 (在更新位置前检测)
         obstacle_collision = False
+        collision_obstacle = None
         for ox, oy, orad in self.obstacles:
             dist = np.sqrt((new_pos[0] - ox)**2 + (new_pos[1] - oy)**2)
             if dist < self.agent_radius + orad:
                 obstacle_collision = True
+                collision_obstacle = (ox, oy, orad)
                 break
         
         # 只有在不碰撞时才更新位置
@@ -390,6 +392,27 @@ class Navigation2DEnv(gym.Env):
                     self.agent_radius + 0.01,
                     self.world_size - self.agent_radius - 0.01
                 )
+            
+            # 如果是障碍物碰撞，将机器人推离障碍物
+            if obstacle_collision and collision_obstacle is not None:
+                ox, oy, orad = collision_obstacle
+                # 计算从障碍物中心指向机器人的方向
+                dx = self.agent_pos[0] - ox
+                dy = self.agent_pos[1] - oy
+                dist = np.sqrt(dx**2 + dy**2)
+                if dist > 1e-6:
+                    # 归一化方向向量
+                    nx, ny = dx / dist, dy / dist
+                    # 计算需要移动的距离，确保机器人完全在障碍物外面
+                    min_safe_dist = self.agent_radius + orad + 0.05
+                    push_dist = min_safe_dist - dist
+                    if push_dist > 0:
+                        # 推离障碍物
+                        new_x = self.agent_pos[0] + nx * push_dist
+                        new_y = self.agent_pos[1] + ny * push_dist
+                        # 确保不会推到墙外
+                        self.agent_pos[0] = np.clip(new_x, self.agent_radius + 0.01, self.world_size - self.agent_radius - 0.01)
+                        self.agent_pos[1] = np.clip(new_y, self.agent_radius + 0.01, self.world_size - self.agent_radius - 0.01)
         
         collision = wall_collision or obstacle_collision
         

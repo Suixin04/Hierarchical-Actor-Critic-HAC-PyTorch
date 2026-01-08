@@ -35,7 +35,7 @@ class Navigation2DConfig(BaseConfig):
         self.max_a_omega = 2.0
         self.depth_rays = 16
         self.depth_max_range = 5.0
-        self.num_obstacles = 0
+        self.num_obstacles = 6
         
         # ==================== 深度编码器 ====================
         self.use_depth_encoder = True
@@ -85,7 +85,8 @@ class Navigation2DConfig(BaseConfig):
         self.subgoal_fov = np.pi
         self.subgoal_r_min = 0.3
         self.subgoal_r_max = 2.5  # 略小于 MPC 可达距离 (15*0.1*2=3m)，留有余量
-        self.subgoal_safety_margin = 0.3
+        self.subgoal_safety_margin = 0.5  # 增加安全裕量，避免碰撞
+        self.agent_radius = 0.2  # 机器人半径，用于深度约束计算
         
         self.level1_subgoal_bounds = np.array([
             (self.subgoal_r_max - self.subgoal_r_min) / 2,
