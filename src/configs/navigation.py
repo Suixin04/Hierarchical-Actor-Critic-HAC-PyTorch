@@ -41,7 +41,7 @@ class Navigation2DConfig(BaseConfig):
         self.use_depth_encoder = True
         self.base_state_dim = 5
         self.depth_dim = self.depth_rays
-        self.embedding_dim = 8
+        self.embedding_dim = 16  # 增大: 8 → 16
         self.depth_fov = 2 * np.pi
         
         # ==================== 状态空间 ====================
@@ -118,7 +118,7 @@ class Navigation2DConfig(BaseConfig):
         self.lr = 0.001
         self.n_iter = 100
         self.batch_size = 128
-        self.hidden_dim = 64
+        self.hidden_dim = 128  # 增大: 64 → 128
         
         # ==================== SAC 参数 ====================
         self.sac_alpha = 0.3

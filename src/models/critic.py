@@ -52,9 +52,13 @@ class SoftQNetwork(nn.Module):
         else:
             input_dim = state_dim + action_dim + goal_dim
         
-        # MLP 主干网络 + Sigmoid 输出
+        # MLP 主干网络 + Sigmoid 输出 (4层)
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),

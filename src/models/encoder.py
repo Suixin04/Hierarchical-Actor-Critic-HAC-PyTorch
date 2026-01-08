@@ -35,8 +35,13 @@ class DepthEncoder(nn.Module):
         self.depth_dim = depth_dim
         self.embedding_dim = embedding_dim
         
+        # 4 层网络: depth → hidden → hidden → hidden → embedding
         self.encoder = nn.Sequential(
             nn.Linear(depth_dim, hidden_dim),
+            nn.LeakyReLU(0.1),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LeakyReLU(0.1),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.LeakyReLU(0.1),
             nn.Linear(hidden_dim, embedding_dim),
             nn.LeakyReLU(0.1)  # 保持梯度流动

@@ -85,9 +85,12 @@ class SACAgent:
         # 创建深度编码器 (如果需要)
         self.depth_encoder: Optional[DepthEncoder] = None
         if use_depth_encoder:
+            # Encoder hidden_dim 跟随主网络
+            encoder_hidden = max(64, hidden_dim // 2)
             self.depth_encoder = DepthEncoder(
                 depth_dim=depth_dim,
-                embedding_dim=embedding_dim
+                embedding_dim=embedding_dim,
+                hidden_dim=encoder_hidden  # 增大 Encoder 容量
             ).to(self._device)
         
         # 创建 Actor

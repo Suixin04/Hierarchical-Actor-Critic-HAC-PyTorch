@@ -64,9 +64,11 @@ class GaussianActor(nn.Module):
             # 不使用编码器: state + goal
             input_dim = state_dim + goal_dim
         
-        # MLP 主干网络
+        # MLP 主干网络 (4层)
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc4 = nn.Linear(hidden_dim, hidden_dim)
         
         # 均值和标准差输出头
         self.mean_head = nn.Linear(hidden_dim, action_dim)
@@ -124,6 +126,8 @@ class GaussianActor(nn.Module):
         
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
+        x = F.relu(self.fc3(x))
+        x = F.relu(self.fc4(x))
         
         mean = self.mean_head(x)
         log_std = self.log_std_head(x)
