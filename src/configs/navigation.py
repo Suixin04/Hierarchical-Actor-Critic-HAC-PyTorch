@@ -5,7 +5,7 @@
 环境: Navigation2DObstacle-v1
 State: [x, y, θ, v, ω, depth_1, ..., depth_16]
 Action: [a_v, a_ω]
-Goal: [x, y, v_desired, θ_desired]  # 4D 目标：位置 + 期望速度 + 期望朝向
+Goal: [x, y]
 """
 
 import numpy as np
@@ -21,7 +21,6 @@ class Navigation2DConfig(BaseConfig):
     关键设计:
     - 使用共享深度编码器
     - Level 1 使用极坐标 + 深度约束
-    - 4D 子目标: (x, y, v, θ) 实现平滑运动
     """
     
     def _setup(self):
@@ -76,47 +75,26 @@ class Navigation2DConfig(BaseConfig):
         self.action_clip_low = np.array([-self.max_a_v, -self.max_a_omega])
         self.action_clip_high = np.array([self.max_a_v, self.max_a_omega])
         
-        # ==================== 目标空间 (4D: x, y, v, θ) ====================
-        # 环境终点目标 (位置 + 到达时速度=0 + 朝向)
-        self.goal_indices = [0, 1, 3, 2]  # 状态中对应 [x, y, v, θ]
-        self.goal_state = np.array([8.5, 8.5, 0.0, 0.0])  # 终点停止，朝向任意
-        self.goal_threshold = np.array([0.5, 0.5, 0.3, np.pi])  # 位置0.5m, 速度0.3m/s, 角度任意
+        # ==================== 目标空间 ====================
+        self.goal_indices = [0, 1]
+        self.goal_state = np.array([8.5, 8.5])
+        self.goal_threshold = np.array([0.5, 0.5])
         
-        # ==================== 子目标空间 (4D: x, y, v, θ) ====================
-        # 子目标边界: [位置边界, 速度边界, 角度边界]
-        self.subgoal_bounds_4d = np.array([
-            self.world_size / 2,  # x
-            self.world_size / 2,  # y
-            self.max_v / 2,       # v (0 ~ max_v)
-            np.pi                 # θ (-π ~ π)
-        ])
-        self.subgoal_offset_4d = np.array([
-            self.world_size / 2,  # x
-            self.world_size / 2,  # y
-            self.max_v / 2,       # v 中心
-            0.0                   # θ 中心
-        ])
-        
-        # ==================== Level 1 极坐标 + 速度/朝向 ====================
+        # ==================== Level 1 极坐标 ====================
         self.level1_use_polar = True
         self.subgoal_fov = np.pi
         self.subgoal_r_min = 0.3
         self.subgoal_r_max = 2.5  # 略小于 MPC 可达距离 (15*0.1*2=3m)，留有余量
         self.subgoal_safety_margin = 0.3
         
-        # Level 1 子目标边界 (转换后为世界坐标 4D)
-        # Actor 输出: [x, y, v, θ]，其中 (x, y) 会经过深度约束
-        self.level1_subgoal_bounds = self.subgoal_bounds_4d.copy()
-        self.level1_subgoal_offset = self.subgoal_offset_4d.copy()
-        
-        # ==================== MPC 代价权重 (4D 目标) ====================
-        # 位置、速度、朝向的权重
-        self.mpc_Q_pos = [10.0, 10.0]      # 位置误差权重
-        self.mpc_Q_vel = 5.0               # 速度误差权重
-        self.mpc_Q_theta = 2.0             # 朝向误差权重
-        self.mpc_Qf_pos = [20.0, 20.0]     # 终端位置权重
-        self.mpc_Qf_vel = 10.0             # 终端速度权重
-        self.mpc_Qf_theta = 5.0            # 终端朝向权重
+        self.level1_subgoal_bounds = np.array([
+            (self.subgoal_r_max - self.subgoal_r_min) / 2,
+            self.subgoal_fov / 2
+        ])
+        self.level1_subgoal_offset = np.array([
+            (self.subgoal_r_max + self.subgoal_r_min) / 2,
+            0.0
+        ])
         
         # ==================== HAC 参数 ====================
         self.k_level = 3
@@ -156,9 +134,9 @@ class Navigation2DConfig(BaseConfig):
         # ==================== 编码器微调 ====================
         self.encoder_finetune_lr = 0.0001
         
-        # ==================== 探索噪声 (4D: x, y, v, θ) ====================
-        self.exploration_action_noise = np.array([0.3, 0.6])  # 底层动作噪声
-        self.exploration_state_noise = np.array([1.0, 1.0, 0.3, 0.5])  # 子目标噪声
+        # ==================== 探索噪声 ====================
+        self.exploration_action_noise = np.array([0.3, 0.6])
+        self.exploration_state_noise = np.array([1.0, 1.0])
         
         # ==================== 训练参数 ====================
         self.max_episodes = 3000

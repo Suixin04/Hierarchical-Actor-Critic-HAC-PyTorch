@@ -69,7 +69,7 @@ class HACAgent:
         
         self.state_dim = config.state_dim
         self.action_dim = config.action_dim
-        self.goal_dim = config.effective_goal_dim  # 现在是 4: [x, y, v, θ]
+        self.goal_dim = config.effective_goal_dim
         self.goal_indices = config.goal_indices
         
         # 深度编码器参数
@@ -78,24 +78,17 @@ class HACAgent:
         self.depth_dim = getattr(config, 'depth_dim', 0)
         self.embedding_dim = getattr(config, 'embedding_dim', 8)
         self.depth_max_range = getattr(config, 'depth_max_range', 5.0)
-        
-        # 最大速度（用于子目标裁剪）
-        self.max_v = getattr(config, 'max_v', 2.0)
     
     def _init_bounds(self, config: Any) -> None:
-        """初始化边界参数 (4D 子目标: x, y, v, θ)"""
+        """初始化边界参数"""
         # 子目标空间 - 为每个层级分别存储
-        # 4D 子目标: [x, y, v, θ]
-        self.subgoal_bounds_4d = torch.FloatTensor(
-            getattr(config, 'subgoal_bounds_4d', config.get_subgoal_bounds(level=2)).reshape(1, -1)
+        # Level 2+: 世界坐标 [x, y]
+        self.subgoal_bounds_l2 = torch.FloatTensor(
+            config.get_subgoal_bounds(level=2).reshape(1, -1)
         ).to(self._device)
-        self.subgoal_offset_4d = torch.FloatTensor(
-            getattr(config, 'subgoal_offset_4d', config.get_subgoal_offset(level=2)).reshape(1, -1)
+        self.subgoal_offset_l2 = torch.FloatTensor(
+            config.get_subgoal_offset(level=2).reshape(1, -1)
         ).to(self._device)
-        
-        # Level 2+: 使用 4D bounds
-        self.subgoal_bounds_l2 = self.subgoal_bounds_4d
-        self.subgoal_offset_l2 = self.subgoal_offset_4d
         
         # Level 1 极坐标参数
         self.level1_use_polar = getattr(config, 'level1_use_polar', False)
@@ -107,10 +100,10 @@ class HACAgent:
             self.depth_rays = getattr(config, 'depth_rays', 16)
             self.depth_fov = getattr(config, 'depth_fov', 2 * np.pi)
             
-            # Level 1: 4D 子目标 (与 Level 2 相同)
-            # Actor 输出 [x, y, v, θ]，其中 (x, y) 会经过深度约束
-            self.subgoal_bounds_l1 = self.subgoal_bounds_4d
-            self.subgoal_offset_l1 = self.subgoal_offset_4d
+            # Level 1: 世界坐标 (与 Level 2 相同，因为 polar->world 转换在 apply_depth_constraint 中处理)
+            # 注意: Actor 直接输出世界坐标子目标，不是极坐标
+            self.subgoal_bounds_l1 = self.subgoal_bounds_l2
+            self.subgoal_offset_l1 = self.subgoal_offset_l2
         else:
             self.subgoal_bounds_l1 = self.subgoal_bounds_l2
             self.subgoal_offset_l1 = self.subgoal_offset_l2
@@ -141,7 +134,7 @@ class HACAgent:
         self.encoder_finetune_lr = getattr(config, 'encoder_finetune_lr', None)
     
     def _init_mpc_params(self, config: Any) -> None:
-        """初始化 MPC 参数 (支持 4D 代价权重)"""
+        """初始化 MPC 参数"""
         self.dt = getattr(config, 'dt', 0.1)
         self.max_v = getattr(config, 'max_v', 2.0)
         self.max_omega = getattr(config, 'max_omega', 2.0)
@@ -151,37 +144,25 @@ class HACAgent:
         self.damping_omega = getattr(config, 'damping_omega', 0.9)
         self.mpc_iterations = getattr(config, 'mpc_iterations', 5)
         self.mpc_lr = getattr(config, 'mpc_lr', 0.5)
-        
-        # 4D 代价权重
-        self.mpc_Q_pos = getattr(config, 'mpc_Q_pos', [10.0, 10.0])
-        self.mpc_Q_vel = getattr(config, 'mpc_Q_vel', 5.0)
-        self.mpc_Q_theta = getattr(config, 'mpc_Q_theta', 2.0)
+        self.mpc_Q = getattr(config, 'mpc_Q', [10.0, 10.0])
         self.mpc_R = getattr(config, 'mpc_R', [0.1, 0.1])
-        self.mpc_Qf_pos = getattr(config, 'mpc_Qf_pos', [20.0, 20.0])
-        self.mpc_Qf_vel = getattr(config, 'mpc_Qf_vel', 10.0)
-        self.mpc_Qf_theta = getattr(config, 'mpc_Qf_theta', 5.0)
+        self.mpc_Qf = getattr(config, 'mpc_Qf', [20.0, 20.0])
         self.mpc_reachability_threshold = getattr(config, 'mpc_reachability_threshold', 0.8)
-        
-        # 兼容旧配置 (只有 mpc_Q/mpc_Qf)
-        if hasattr(config, 'mpc_Q') and not hasattr(config, 'mpc_Q_pos'):
-            self.mpc_Q_pos = config.mpc_Q
-        if hasattr(config, 'mpc_Qf') and not hasattr(config, 'mpc_Qf_pos'):
-            self.mpc_Qf_pos = config.mpc_Qf
     
     def _build_hierarchy(self, lr: float) -> None:
         """构建分层策略"""
         self.policies: List = []
         self.buffers: List[Optional[ReplayBuffer]] = []
         
-        # Level 0: MPC 控制器 (支持 4D 目标)
-        Q_pos = torch.FloatTensor(self.mpc_Q_pos)
+        # Level 0: MPC 控制器
+        Q = torch.FloatTensor(self.mpc_Q)
         R = torch.FloatTensor(self.mpc_R)
-        Qf_pos = torch.FloatTensor(self.mpc_Qf_pos)
+        Qf = torch.FloatTensor(self.mpc_Qf)
         
         self.mpc = MPCController(
             state_dim=self.state_dim,
             action_dim=self.action_dim,
-            goal_dim=self.goal_dim,  # 现在是 4
+            goal_dim=self.goal_dim,
             horizon=self.H,
             dt=self.dt,
             max_v=self.max_v,
@@ -192,13 +173,7 @@ class HACAgent:
             damping_omega=self.damping_omega,
             num_iterations=self.mpc_iterations,
             lr=self.mpc_lr,
-            Q_pos=Q_pos, 
-            Q_vel=self.mpc_Q_vel,
-            Q_theta=self.mpc_Q_theta,
-            R=R, 
-            Qf_pos=Qf_pos,
-            Qf_vel=self.mpc_Qf_vel,
-            Qf_theta=self.mpc_Qf_theta,
+            Q=Q, R=R, Qf=Qf,
         )
         
         self.policies.append(self.mpc)
@@ -244,7 +219,6 @@ class HACAgent:
     def _print_summary(self) -> None:
         """打印初始化摘要"""
         print(f"HAC initialized:")
-        print(f"  Goal dim: {self.goal_dim} (x, y, v, θ)")
         print(f"  High-level (Level 1+): SAC")
         print(f"  Low-level (Level 0): MPC (horizon={self.H})")
         print(f"  Dynamics: damping_v={self.damping_v}, damping_omega={self.damping_omega}")
@@ -267,17 +241,14 @@ class HACAgent:
         subgoal: np.ndarray
     ) -> np.ndarray:
         """
-        应用基于深度的安全约束 (支持 4D 子目标)
-        
-        对于 4D 子目标 [x, y, v, θ]，只约束位置 (x, y) 部分，
-        保留速度 v 和朝向 θ 不变。
+        应用基于深度的安全约束
         
         Args:
             state: 当前状态
-            subgoal: 世界坐标子目标 [x, y] 或 [x, y, v, θ]
+            subgoal: 世界坐标子目标 [x, y]
             
         Returns:
-            约束后的子目标 (维度与输入相同)
+            约束后的子目标 [x, y]
         """
         if not self.level1_use_polar:
             return subgoal
@@ -285,11 +256,8 @@ class HACAgent:
         agent_pos = state[:2]
         agent_theta = state[2]
         
-        # 提取位置部分
-        goal_pos = subgoal[:2]
-        
         # 世界坐标 -> 极坐标
-        r, theta_rel = world_to_polar(agent_pos, agent_theta, goal_pos)
+        r, theta_rel = world_to_polar(agent_pos, agent_theta, subgoal)
         
         # 获取该方向的深度
         depth = self._get_depth_at_angle(state, theta_rel)
@@ -310,20 +278,7 @@ class HACAgent:
         dx = r_constrained * np.cos(theta_world)
         dy = r_constrained * np.sin(theta_world)
         
-        constrained_pos = agent_pos + np.array([dx, dy])
-        
-        # 如果是 4D 子目标，保留速度和朝向
-        if len(subgoal) >= 4:
-            return np.array([
-                constrained_pos[0], 
-                constrained_pos[1], 
-                subgoal[2],  # v_desired
-                subgoal[3]   # θ_desired
-            ])
-        elif len(subgoal) >= 3:
-            return np.array([constrained_pos[0], constrained_pos[1], subgoal[2]])
-        else:
-            return constrained_pos
+        return agent_pos + np.array([dx, dy])
     
     def _get_depth_at_angle(self, state: np.ndarray, theta_rel: float) -> float:
         """获取指定角度的深度读数 (插值)"""
@@ -408,7 +363,7 @@ class HACAgent:
         goal_transitions = []
         
         self.goals[level] = goal
-        self.goals_world[level] = goal.copy()  # 保存完整的 4D 子目标 [x, y, v, θ]
+        self.goals_world[level] = goal[:2] if len(goal) >= 2 else goal
         
         for _ in range(self.H):
             # 高层 (Level > 0): SAC
@@ -446,32 +401,35 @@ class HACAgent:
         is_subgoal_test: bool,
         goal_transitions: List
     ) -> Tuple[np.ndarray, bool, np.ndarray]:
-        """运行高层策略 (4D 子目标)"""
+        """运行高层策略"""
         policy = self.policies[level]
         
-        # 选择子目标 (4D: x, y, v, θ)
+        # 选择子目标
         subgoal = policy.select_action(state, goal, deterministic=is_subgoal_test)
         
-        # 边界裁剪 (4D: 位置 + 速度 + 角度)
-        subgoal = self._clip_subgoal(subgoal)
+        # 边界裁剪
+        subgoal = np.clip(
+            subgoal,
+            [self.boundary_margin, self.boundary_margin],
+            [self.config.world_size - self.boundary_margin] * 2
+        )
         
-        # Level 1: 深度约束 (只约束位置)
+        # Level 1: 深度约束
         if level == 1 and self.level1_use_polar:
             subgoal = self.apply_depth_constraint(state, subgoal)
         
         # Level 1: MPC 可达性预测
         if level == 1:
-            is_reachable, _, pred_goal_4d = self.mpc.predict_reachability(
+            is_reachable, _, pred_final = self.mpc.predict_reachability(
                 state, subgoal, self.mpc_reachability_threshold
             )
             
             if not is_reachable:
-                # 不可达，惩罚并使用 MPC 预测的 4D 替代目标
+                # 不可达，惩罚并使用预测位置
                 self.buffers[level].add((
                     state, subgoal, -self.H, state, goal, 0.0, 0.0
                 ))
-                # pred_goal_4d 已经是完整的 [x, y, v, θ]，直接使用
-                next_state, done = self.run_HAC(env, 0, state, pred_goal_4d, False)
+                next_state, done = self.run_HAC(env, 0, state, pred_final, False)
             else:
                 next_state, done = self.run_HAC(env, 0, state, subgoal, False)
                 
@@ -495,35 +453,6 @@ class HACAgent:
             action = self.extract_goal_state(next_state)
         
         return next_state, done, action
-    
-    def _clip_subgoal(self, subgoal: np.ndarray) -> np.ndarray:
-        """
-        裁剪 4D 子目标到有效范围
-        
-        Args:
-            subgoal: [x, y, v, θ] 或 [x, y]
-            
-        Returns:
-            裁剪后的子目标
-        """
-        margin = self.boundary_margin
-        world_size = self.config.world_size
-        
-        clipped = subgoal.copy()
-        
-        # 位置裁剪
-        clipped[0] = np.clip(clipped[0], margin, world_size - margin)
-        clipped[1] = np.clip(clipped[1], margin, world_size - margin)
-        
-        if len(subgoal) >= 3:
-            # 速度裁剪 [0, max_v]
-            clipped[2] = np.clip(clipped[2], 0.0, self.max_v)
-        
-        if len(subgoal) >= 4:
-            # 角度归一化到 [-π, π]
-            clipped[3] = np.arctan2(np.sin(clipped[3]), np.cos(clipped[3]))
-        
-        return clipped
     
     def _run_low_level(
         self,
@@ -629,17 +558,19 @@ class HACAgent:
         goal: np.ndarray
     ) -> Tuple[np.ndarray, bool]:
         """
-        推理模式的 HAC 递归执行 (4D 子目标)
+        推理模式的 HAC 递归执行
         
         与训练版本的 run_HAC 类似，但：
         - 不存储任何转换
         - 使用确定性策略（不加噪声）
         
+        官方实现参考: https://github.com/nikhilbarhate99/Hierarchical-Actor-Critic-HAC-PyTorch
+        
         Args:
             env: 环境
             level: 当前层级
             state: 当前状态
-            goal: 目标 (4D: x, y, v, θ)
+            goal: 目标
             
         Returns:
             (最终状态, 是否结束)
@@ -647,17 +578,21 @@ class HACAgent:
         done = False
         
         self.goals[level] = goal
-        self.goals_world[level] = goal.copy()  # 保存完整的 4D 子目标 [x, y, v, θ]
+        self.goals_world[level] = goal[:2] if len(goal) >= 2 else goal
         
         # H 次尝试
         for _ in range(self.H):
             if level > 0:
-                # 高层: SAC 策略输出子目标 (4D)
+                # 高层: SAC 策略输出子目标
                 policy = self.policies[level]
                 subgoal = policy.select_action(state, goal, deterministic=True)
                 
-                # 边界裁剪 (4D)
-                subgoal = self._clip_subgoal(subgoal)
+                # 边界裁剪
+                subgoal = np.clip(
+                    subgoal,
+                    [self.boundary_margin, self.boundary_margin],
+                    [self.config.world_size - self.boundary_margin] * 2
+                )
                 
                 # Level 1: 深度约束
                 if level == 1 and self.level1_use_polar:
@@ -732,12 +667,16 @@ class HACAgent:
                 if subgoal is not None:
                     self._attempts_remaining[level] -= 1
                 
-                # 使用当前层策略生成新的子目标 (4D)
+                # 使用当前层策略生成新的子目标
                 policy = self.policies[level]
                 new_subgoal = policy.select_action(state, goal, deterministic=deterministic)
                 
-                # 边界裁剪 (4D)
-                new_subgoal = self._clip_subgoal(new_subgoal)
+                # 边界裁剪
+                new_subgoal = np.clip(
+                    new_subgoal,
+                    [self.boundary_margin, self.boundary_margin],
+                    [self.config.world_size - self.boundary_margin] * 2
+                )
                 
                 # Level 1: 深度约束
                 if level == 1 and self.level1_use_polar:
@@ -745,7 +684,7 @@ class HACAgent:
                 
                 # 设置下一层的目标
                 self.goals[level - 1] = new_subgoal
-                self.goals_world[level - 1] = new_subgoal.copy()  # 保存完整的 4D 子目标 [x, y, v, θ]
+                self.goals_world[level - 1] = new_subgoal[:2] if len(new_subgoal) >= 2 else new_subgoal
                 
                 # 重置下一层的尝试次数
                 self._attempts_remaining[level - 1] = self.H
@@ -765,7 +704,7 @@ class HACAgent:
     def set_goal(self, goal: np.ndarray) -> None:
         """设置最终目标"""
         self.goals[self.k_level - 1] = goal
-        self.goals_world[self.k_level - 1] = goal.copy()  # 保存完整的 4D 目标 [x, y, v, θ]
+        self.goals_world[self.k_level - 1] = goal[:2] if len(goal) >= 2 else goal
         # 初始化尝试次数
         if not hasattr(self, '_attempts_remaining'):
             self._attempts_remaining = [0] * self.k_level
