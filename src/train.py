@@ -180,14 +180,11 @@ def train(args: argparse.Namespace) -> None:
             if hasattr(env.unwrapped, 'obstacles'):
                 agent.set_obstacles(env.unwrapped.obstacles)
             
-            # 构造 4D 环境目标: [x, y, v, θ]
-            if hasattr(env.unwrapped, 'goal_pos'):
-                goal_pos = env.unwrapped.goal_pos
-                goal_theta = getattr(env.unwrapped, 'goal_theta', 0.0)
-                # 4D 目标: 位置 + 到达时速度=0 + 朝向
-                env_goal = np.array([goal_pos[0], goal_pos[1], 0.0, goal_theta])
-            else:
-                env_goal = config.goal_state
+            env_goal = (
+                env.unwrapped.goal_pos 
+                if hasattr(env.unwrapped, 'goal_pos') 
+                else config.goal_state
+            )
             
             last_state, done = agent.run_HAC(
                 env, config.k_level - 1, state, env_goal, is_subgoal_test=False
@@ -423,13 +420,12 @@ def test(args: argparse.Namespace) -> None:
         state, _ = env.reset()
         agent.reset()
         
-        # 构造 4D 环境目标: [x, y, v, θ]
-        if hasattr(env.unwrapped, 'goal_pos'):
-            goal_pos = env.unwrapped.goal_pos
-            goal_theta = getattr(env.unwrapped, 'goal_theta', 0.0)
-            env_goal = np.array([goal_pos[0], goal_pos[1], 0.0, goal_theta])
-        else:
-            env_goal = config.goal_state
+        # 获取目标
+        env_goal = (
+            env.unwrapped.goal_pos 
+            if hasattr(env.unwrapped, 'goal_pos') 
+            else config.goal_state
+        )
         
         # 使用官方风格的递归执行
         # 参考: https://github.com/nikhilbarhate99/Hierarchical-Actor-Critic-HAC-PyTorch
