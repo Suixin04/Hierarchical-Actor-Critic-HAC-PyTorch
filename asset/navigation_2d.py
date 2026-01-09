@@ -441,22 +441,30 @@ class Navigation2DEnv(gym.Env):
         
         return self._get_obs(), reward, terminated, truncated, info
     
-    def _init_pygame(self):
+    def _init_pygame(self, force_human=False):
         """初始化 pygame"""
-        if self.render_mode is None:
+        render_mode = self.render_mode
+        if force_human:
+            render_mode = "human"
+            self.render_mode = "human"
+        
+        if render_mode is None:
             return None
         
         try:
             import pygame
         except ImportError:
+            print("[WARNING] pygame not installed. Run: pip install pygame")
             return None
         
+        # 初始化 pygame（不初始化 font 模块）
+        if not pygame.display.get_init():
+            pygame.display.init()
+        
         if self.screen is None:
-            pygame.init()
-            if self.render_mode == "human":
-                pygame.display.init()
+            if render_mode == "human":
                 self.screen = pygame.display.set_mode((self.screen_size, self.screen_size))
-                pygame.display.set_caption("Navigation2D - Differential Drive")
+                pygame.display.set_caption("Navigation2D - HAC")
             else:
                 self.screen = pygame.Surface((self.screen_size, self.screen_size))
         
@@ -466,58 +474,66 @@ class Navigation2DEnv(gym.Env):
         return pygame
     
     def _draw_base(self, pygame):
-        """绘制基础场景（不包含 flip）"""
-        self.screen.fill((255, 255, 255))
+        """绘制基础场景"""
+        self.screen.fill((245, 245, 245))
         
-        # 绘制障碍物
+        # 网格
+        for i in range(int(self.world_size) + 1):
+            x = int(i * self.scale)
+            pygame.draw.line(self.screen, (220, 220, 220), (x, 0), (x, self.screen_size), 1)
+            y = int(i * self.scale)
+            pygame.draw.line(self.screen, (220, 220, 220), (0, y), (self.screen_size, y), 1)
+        
+        # 边界
+        pygame.draw.rect(self.screen, (100, 100, 100), (0, 0, self.screen_size, self.screen_size), 3)
+        
+        # 障碍物
         for ox, oy, orad in self.obstacles:
-            pygame.draw.circle(
-                self.screen, (100, 100, 100),
-                (int(ox * self.scale), int((self.world_size - oy) * self.scale)),
-                int(orad * self.scale)
-            )
+            cx = int(ox * self.scale)
+            cy = int((self.world_size - oy) * self.scale)
+            r = int(orad * self.scale)
+            pygame.draw.circle(self.screen, (80, 80, 80), (cx + 3, cy + 3), r)
+            pygame.draw.circle(self.screen, (120, 120, 120), (cx, cy), r)
         
-        # 绘制目标
-        goal_screen = (
-            int(self.goal_pos[0] * self.scale),
-            int((self.world_size - self.goal_pos[1]) * self.scale)
-        )
-        pygame.draw.circle(self.screen, (0, 200, 0), goal_screen, 15)
-        # 绘制目标朝向
-        goal_arrow_end = (
-            int((self.goal_pos[0] + np.cos(self.goal_theta) * 0.5) * self.scale),
-            int((self.world_size - (self.goal_pos[1] + np.sin(self.goal_theta) * 0.5)) * self.scale)
-        )
-        pygame.draw.line(self.screen, (0, 150, 0), goal_screen, goal_arrow_end, 3)
+        # 目标（绿色）
+        gx = int(self.goal_pos[0] * self.scale)
+        gy = int((self.world_size - self.goal_pos[1]) * self.scale)
+        pygame.draw.circle(self.screen, (0, 200, 0), (gx, gy), 18, 3)
+        pygame.draw.circle(self.screen, (100, 255, 100), (gx, gy), 12)
+        # 目标朝向
+        gax = int((self.goal_pos[0] + np.cos(self.goal_theta) * 0.6) * self.scale)
+        gay = int((self.world_size - (self.goal_pos[1] + np.sin(self.goal_theta) * 0.6)) * self.scale)
+        pygame.draw.line(self.screen, (0, 150, 0), (gx, gy), (gax, gay), 4)
         
-        # 绘制深度射线
+        # 深度射线
         self._draw_depth_rays(pygame)
         
-        # 绘制机器人
-        agent_screen = (
-            int(self.agent_pos[0] * self.scale),
-            int((self.world_size - self.agent_pos[1]) * self.scale)
-        )
-        pygame.draw.circle(self.screen, (50, 50, 200), agent_screen, int(self.agent_radius * self.scale))
+        # 机器人
+        ax = int(self.agent_pos[0] * self.scale)
+        ay = int((self.world_size - self.agent_pos[1]) * self.scale)
+        ar = int(self.agent_radius * self.scale)
+        pygame.draw.circle(self.screen, (30, 30, 100), (ax + 2, ay + 2), ar)
+        pygame.draw.circle(self.screen, (70, 70, 220), (ax, ay), ar)
+        pygame.draw.circle(self.screen, (255, 255, 255), (ax, ay), ar, 2)
         
-        # 绘制机器人朝向
-        arrow_len = 0.5
-        arrow_end = (
-            int((self.agent_pos[0] + np.cos(self.agent_theta) * arrow_len) * self.scale),
-            int((self.world_size - (self.agent_pos[1] + np.sin(self.agent_theta) * arrow_len)) * self.scale)
-        )
-        pygame.draw.line(self.screen, (200, 50, 50), agent_screen, arrow_end, 3)
+        # 机器人朝向
+        aax = int((self.agent_pos[0] + np.cos(self.agent_theta) * 0.5) * self.scale)
+        aay = int((self.world_size - (self.agent_pos[1] + np.sin(self.agent_theta) * 0.5)) * self.scale)
+        pygame.draw.line(self.screen, (255, 100, 100), (ax, ay), (aax, aay), 4)
     
     def render(self):
         """渲染环境"""
         pygame = self._init_pygame()
         if pygame is None:
-            return
+            return None
         
         self._draw_base(pygame)
         
         if self.render_mode == "human":
-            pygame.event.pump()
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    self.close()
+                    return None
             pygame.display.flip()
             self.clock.tick(self.metadata["render_fps"])
         
@@ -535,129 +551,95 @@ class Navigation2DEnv(gym.Env):
         angle_step = self.depth_fov / self.depth_rays
         depths = self._get_depth_readings()
         
+        ax = int(self.agent_pos[0] * self.scale)
+        ay = int((self.world_size - self.agent_pos[1]) * self.scale)
+        
         for i in range(self.depth_rays):
             angle = start_angle + (i + 0.5) * angle_step
-            dx, dy = np.cos(angle), np.sin(angle)
-            
-            end_x = self.agent_pos[0] + dx * depths[i]
-            end_y = self.agent_pos[1] + dy * depths[i]
-            
-            start_screen = (
-                int(self.agent_pos[0] * self.scale),
-                int((self.world_size - self.agent_pos[1]) * self.scale)
-            )
-            end_screen = (
-                int(end_x * self.scale),
-                int((self.world_size - end_y) * self.scale)
-            )
+            end_x = int((self.agent_pos[0] + np.cos(angle) * depths[i]) * self.scale)
+            end_y = int((self.world_size - (self.agent_pos[1] + np.sin(angle) * depths[i])) * self.scale)
             
             ratio = depths[i] / self.depth_max_range
-            color = (int(255 * (1 - ratio)), int(255 * ratio), 0)
-            pygame.draw.line(self.screen, color, start_screen, end_screen, 1)
+            color = (int(180 * (1 - ratio)), int(180 * ratio), 80)
+            pygame.draw.line(self.screen, color, (ax, ay), (end_x, end_y), 1)
     
     def render_subgoals(self, goals: list, mode='human'):
-        """
-        通用子目标渲染方法 - 支持任意层级数量
-        
-        Args:
-            goals: 目标列表，从底层到高层 [goal_0, goal_1, ..., goal_k-1]
-                   goal_0: 底层目标 (最小的圆)
-                   goal_k-1: 最高层目标 (最终目标，最大的圆)
-            mode: 渲染模式
-        """
-        if self.render_mode is None:
-            return
-        
-        pygame = self._init_pygame()
+        """渲染带有分层子目标的场景"""
+        pygame = self._init_pygame(force_human=(mode == 'human'))
         if pygame is None:
             return
         
-        # 先绘制基础场景（不 flip）
         self._draw_base(pygame)
         
         if not goals:
             if self.render_mode == "human":
-                pygame.event.pump()
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        self.close()
+                        return
                 pygame.display.flip()
                 self.clock.tick(self.metadata["render_fps"])
             return
         
-        # 颜色梯度: 从紫色(底层)到橙色(高层)，最终目标为绿色
-        # 使用HSV色彩空间: 紫色(280°) -> 橙色(30°)
-        k_level = len(goals)
+        # 层级颜色
+        colors = [
+            (255, 80, 80),    # L0: 红
+            (255, 200, 50),   # L1: 黄
+            (100, 255, 200),  # L2: 青
+            (150, 100, 255),  # L3: 紫
+        ]
         
-        for i, goal in enumerate(goals):
-            if goal is None:
+        k = len(goals)
+        
+        # 从高层到底层绘制
+        for i in range(k - 1, -1, -1):
+            g = goals[i]
+            if g is None or i == k - 1:
                 continue
             
-            # 计算颜色 (从紫色到橙色到绿色)
-            if i == k_level - 1:
-                # 最终目标: 绿色 (已在 render() 中绘制)
-                continue
+            color = colors[min(i, len(colors) - 1)]
+            radius = 12 - i * 2
+            
+            px = int(g[0] * self.scale)
+            py = int((self.world_size - g[1]) * self.scale)
+            
+            # 圆
+            pygame.draw.circle(self.screen, (50, 50, 50), (px, py), radius + 2, 2)
+            pygame.draw.circle(self.screen, color, (px, py), radius)
+            
+            # 朝向箭头
+            if len(g) >= 4:
+                theta = g[3]
+                arrow_len = 0.3 + g[2] * 0.2
+            elif len(g) >= 3:
+                theta = g[2]
+                arrow_len = 0.4
             else:
-                # 子目标: 紫色(底层) -> 橙色(高层)
-                t = i / max(k_level - 2, 1) if k_level > 2 else 0
-                # 紫色 RGB(150, 50, 150) -> 橙色 RGB(255, 150, 0)
-                r = int(150 + t * 105)
-                g = int(50 + t * 100)
-                b = int(150 - t * 150)
-                color = (r, g, b)
+                continue
             
-            # 计算圆的大小: 底层最小，高层最大
-            base_radius = 6
-            radius = base_radius + i * 3
-            
-            # 绘制目标位置
-            pos_screen = (
-                int(goal[0] * self.scale),
-                int((self.world_size - goal[1]) * self.scale)
-            )
-            pygame.draw.circle(self.screen, color, pos_screen, radius)
-            pygame.draw.circle(self.screen, (50, 50, 50), pos_screen, radius, 1)  # 边框
-            
-            # 如果目标包含速度和朝向 (4D: x, y, v, θ)，用箭头表示
-            # 箭头方向 = 朝向 θ，箭头长度 = 速度 v
-            if len(goal) >= 4:
-                v = goal[2]       # 速度
-                theta = goal[3]   # 朝向
-                # 箭头长度与速度成正比，基础长度 + 速度缩放
-                base_arrow_len = 0.15
-                speed_scale = 0.25  # 速度到长度的缩放因子
-                arrow_len = base_arrow_len + v * speed_scale
-                
-                arrow_end = (
-                    int((goal[0] + np.cos(theta) * arrow_len) * self.scale),
-                    int((self.world_size - (goal[1] + np.sin(theta) * arrow_len)) * self.scale)
-                )
-                # 绘制箭头主干
-                pygame.draw.line(self.screen, color, pos_screen, arrow_end, 2)
-                
-                # 绘制箭头头部 (三角形)
-                arrow_head_size = 4 + i * 1  # 箭头头部大小
-                angle_offset = 2.5  # 箭头张角 (弧度)
-                head_len = arrow_head_size / self.scale
-                head1 = (
-                    int((goal[0] + np.cos(theta) * arrow_len - np.cos(theta - angle_offset) * head_len) * self.scale),
-                    int((self.world_size - (goal[1] + np.sin(theta) * arrow_len - np.sin(theta - angle_offset) * head_len)) * self.scale)
-                )
-                head2 = (
-                    int((goal[0] + np.cos(theta) * arrow_len - np.cos(theta + angle_offset) * head_len) * self.scale),
-                    int((self.world_size - (goal[1] + np.sin(theta) * arrow_len - np.sin(theta + angle_offset) * head_len)) * self.scale)
-                )
-                pygame.draw.polygon(self.screen, color, [arrow_end, head1, head2])
-            elif len(goal) >= 3:
-                # 兼容旧的 3D 目标 (x, y, θ)
-                theta = goal[2]
-                arrow_len = 0.3 + i * 0.1
-                arrow_end = (
-                    int((goal[0] + np.cos(theta) * arrow_len) * self.scale),
-                    int((self.world_size - (goal[1] + np.sin(theta) * arrow_len)) * self.scale)
-                )
-                pygame.draw.line(self.screen, color, pos_screen, arrow_end, 2)
+            ex = int((g[0] + np.cos(theta) * arrow_len) * self.scale)
+            ey = int((self.world_size - (g[1] + np.sin(theta) * arrow_len)) * self.scale)
+            pygame.draw.line(self.screen, color, (px, py), (ex, ey), 3)
         
-        # 统一在最后 flip
+        # 机器人到目标的虚线
+        if goals[0] is not None:
+            ax = int(self.agent_pos[0] * self.scale)
+            ay = int((self.world_size - self.agent_pos[1]) * self.scale)
+            gx = int(goals[0][0] * self.scale)
+            gy = int((self.world_size - goals[0][1]) * self.scale)
+            
+            dx, dy = gx - ax, gy - ay
+            dist = max(1, int(np.sqrt(dx*dx + dy*dy)))
+            for j in range(0, dist, 16):
+                s = (ax + dx * j // dist, ay + dy * j // dist)
+                e = (ax + dx * min(j + 8, dist) // dist, ay + dy * min(j + 8, dist) // dist)
+                pygame.draw.line(self.screen, (200, 100, 100), s, e, 2)
+        
         if self.render_mode == "human":
-            pygame.event.pump()
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    self.close()
+                    return
             pygame.display.flip()
             self.clock.tick(self.metadata["render_fps"])
     
@@ -671,41 +653,14 @@ class Navigation2DEnv(gym.Env):
         self.render_subgoals([low_goal, mid_goal, high_goal], mode)
     
     def close(self):
-        """关闭环境"""
+        """关闭环境 - 安全清理"""
         if self.screen is not None:
-            import pygame
-            pygame.display.quit()
-            pygame.quit()
-            self.screen = None
-            self.clock = None
-
-
-class Navigation2DSimpleEnv(Navigation2DEnv):
-    """
-    简化版差速机器人 (无深度传感器，无障碍物)
-    
-    State: [x, y, θ, v, ω]
-    Goal: [x, y, θ]
-    
-    适合用于初始训练和调试
-    """
-    
-    def __init__(self, render_mode=None, **kwargs):
-        # 无障碍物，无深度传感器
-        super().__init__(render_mode=render_mode, depth_rays=0, num_obstacles=0, **kwargs)
-        
-        self.state_dim = self.inertial_dim  # 5
-        self.depth_dim = 0
-        
-        low = np.array([0, 0, -np.pi, -self.max_v, -self.max_omega], dtype=np.float32)
-        high = np.array([self.world_size, self.world_size, np.pi, self.max_v, self.max_omega], dtype=np.float32)
-        self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
-    
-    def _get_obs(self) -> np.ndarray:
-        """State: [x, y, θ, v, ω]"""
-        return np.array([
-            self.agent_pos[0], self.agent_pos[1],
-            self.agent_theta,
-            self.agent_v,
-            self.agent_omega
-        ], dtype=np.float32)
+            try:
+                import pygame
+                pygame.display.quit()
+                pygame.quit()
+            except:
+                pass
+            finally:
+                self.screen = None
+                self.clock = None

@@ -1,7 +1,7 @@
 """
 HAC-MPC: Hierarchical Actor-Critic with Model Predictive Control
 
-一个清晰、模块化的分层强化学习框架。
+分层强化学习框架。
 
 目录结构:
     src/
@@ -9,7 +9,6 @@ HAC-MPC: Hierarchical Actor-Critic with Model Predictive Control
     │   ├── sac.py       # SAC 算法
     │   └── hac.py       # HAC 分层算法
     ├── models/          # 神经网络模型
-    │   ├── networks.py  # 通用网络层
     │   ├── actor.py     # Actor 网络
     │   ├── critic.py    # Critic 网络
     │   └── encoder.py   # 深度编码器
@@ -25,7 +24,10 @@ HAC-MPC: Hierarchical Actor-Critic with Model Predictive Control
     ├── configs/         # 配置管理
     │   ├── base.py
     │   └── navigation.py
-    └── train.py         # 训练入口
+    └── evaluation/      # 评估和可视化
+        ├── metrics.py
+        └── visualize.py
 """
 
 __version__ = "2.0.0"
+

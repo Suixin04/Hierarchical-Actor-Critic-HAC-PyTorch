@@ -1,445 +1,131 @@
 """Hierarchical Actor-Critic 智能体
 
 实现分层强化学习:
-- 高层 (Level 1+): SAC 策略网络，输出子目标
+- 高层 (Level 1+): SAC 策略，输出子目标 (世界坐标)
 - 底层 (Level 0): MPC 控制器，追踪子目标
 
-特点:
-- 底层使用已知动力学模型，无需学习基础控制
-- 高层专注于学习高级规划策略
-- Level 1 使用 MPC 预测可达性
-- 支持端到端梯度回传
+设计原则:
+- 每层梯度独立，不互相干扰
+- 统一使用世界坐标系
+- MPC 只负责追踪，不参与学习
 """
 
 import torch
-import torch.optim as optim
 import numpy as np
-from typing import Optional, List, Tuple, Dict, Any
+from typing import Optional, List, Tuple
 import os
+import time
 
 from src.agents.sac import SACAgent
 from src.control.mpc import MPCController
 from src.buffers.replay_buffer import ReplayBuffer
-from src.utils.common import get_device, to_tensor, to_numpy
-from src.utils.coordinate import world_to_polar
+from src.utils.common import get_device, to_tensor
 
 
 class HACAgent:
     """
     分层 Actor-Critic 智能体
     
-    高层: SAC 策略 (学习输出子目标)
-    底层: MPC 控制器 (追踪子目标)
+    层级结构:
+    - Level k-1 (最高层): SAC, 输出子目标给下层
+    - ...
+    - Level 1: SAC, 输出子目标给 MPC
+    - Level 0: MPC 控制器, 输出原始动作 [a_v, a_ω]
     
     Args:
         config: 环境配置对象
         render: 是否渲染
     """
     
-    def __init__(self, config: Any, render: bool = False):
+    def __init__(self, config, render: bool = False):
         self.config = config
         self.render = render
         self._device = get_device()
         
         # 从配置提取参数
-        self._init_dimensions(config)
-        self._init_bounds(config)
-        self._init_algorithm_params(config)
-        self._init_mpc_params(config)
-        
-        # 构建层级策略
-        self._build_hierarchy(config.lr)
-        
-        # 运行时状态
-        self.goals: List[Optional[np.ndarray]] = [None] * self.k_level
-        self.goals_world: List[Optional[np.ndarray]] = [None] * self.k_level
-        self.reward = 0.0
-        self.timestep = 0
-        self.privileged_obstacles: List[Tuple[float, float, float]] = []
-        
-        # 推理模式状态：每层的剩余尝试次数
-        self._attempts_remaining: List[int] = [0] * self.k_level
-        
-        self._print_summary()
-    
-    def _init_dimensions(self, config: Any) -> None:
-        """初始化维度参数"""
         self.k_level = config.k_level
         self.H = config.H
-        
-        self.state_dim = config.state_dim
-        self.action_dim = config.action_dim
-        self.goal_dim = config.effective_goal_dim
-        self.goal_indices = config.goal_indices
-        
-        # 深度编码器参数
-        self.use_depth_encoder = getattr(config, 'use_depth_encoder', False)
-        self.base_state_dim = getattr(config, 'base_state_dim', 5)
-        self.depth_dim = getattr(config, 'depth_dim', 0)
-        self.embedding_dim = getattr(config, 'embedding_dim', 8)
-        self.depth_max_range = getattr(config, 'depth_max_range', 5.0)
-    
-    def _init_bounds(self, config: Any) -> None:
-        """初始化边界参数"""
-        # 子目标空间 - 为每个层级分别存储
-        # Level 2+: 世界坐标 [x, y]
-        self.subgoal_bounds_l2 = torch.FloatTensor(
-            config.get_subgoal_bounds(level=2).reshape(1, -1)
-        ).to(self._device)
-        self.subgoal_offset_l2 = torch.FloatTensor(
-            config.get_subgoal_offset(level=2).reshape(1, -1)
-        ).to(self._device)
-        
-        # Level 1 极坐标参数
-        self.level1_use_polar = getattr(config, 'level1_use_polar', False)
-        if self.level1_use_polar:
-            self.subgoal_r_min = config.subgoal_r_min
-            self.subgoal_r_max = config.subgoal_r_max
-            self.subgoal_fov = config.subgoal_fov
-            self.subgoal_safety_margin = getattr(config, 'subgoal_safety_margin', 0.3)
-            self.depth_rays = getattr(config, 'depth_rays', 16)
-            self.depth_fov = getattr(config, 'depth_fov', 2 * np.pi)
-            
-            # Level 1: 世界坐标 (与 Level 2 相同，因为 polar->world 转换在 apply_depth_constraint 中处理)
-            # 注意: Actor 直接输出世界坐标子目标，不是极坐标
-            self.subgoal_bounds_l1 = self.subgoal_bounds_l2
-            self.subgoal_offset_l1 = self.subgoal_offset_l2
-        else:
-            self.subgoal_bounds_l1 = self.subgoal_bounds_l2
-            self.subgoal_offset_l1 = self.subgoal_offset_l2
-        
-        # 动作空间
-        self.action_bounds = torch.FloatTensor(
-            config.action_bounds.reshape(1, -1)
-        ).to(self._device)
-        self.action_offset = torch.FloatTensor(
-            config.action_offset.reshape(1, -1)
-        ).to(self._device)
-        
-        self.boundary_margin = getattr(config, 'boundary_margin', 0.1)
-    
-    def _init_algorithm_params(self, config: Any) -> None:
-        """初始化算法参数"""
         self.lamda = config.lamda
         self.gamma = config.gamma
         self.threshold = config.goal_threshold
         
-        # SAC 参数
-        self.hidden_dim = getattr(config, 'hidden_dim', 64)
-        self.sac_alpha = getattr(config, 'sac_alpha', 0.2)
-        self.sac_auto_entropy = getattr(config, 'sac_auto_entropy', True)
-        self.sac_target_entropy = getattr(config, 'sac_target_entropy', None)
-        self.sac_alpha_lr = getattr(config, 'sac_alpha_lr', None)
+        self.state_dim = config.state_dim
+        self.action_dim = config.action_dim
+        self.goal_dim = config.goal_dim
+        self.world_size = config.world_size
         
-        self.encoder_finetune_lr = getattr(config, 'encoder_finetune_lr', None)
+        # 子目标边界 (世界坐标)
+        self.subgoal_bounds = torch.FloatTensor(
+            config.get_subgoal_bounds().reshape(1, -1)
+        ).to(self._device)
+        self.subgoal_offset = torch.FloatTensor(
+            config.get_subgoal_offset().reshape(1, -1)
+        ).to(self._device)
+        
+        # 构建层级
+        self._build_hierarchy(config)
+        
+        # 运行时状态
+        self.goals: List[Optional[np.ndarray]] = [None] * self.k_level
+        self.reward = 0.0
+        self.timestep = 0
+        
+        self._print_summary()
     
-    def _init_mpc_params(self, config: Any) -> None:
-        """初始化 MPC 参数"""
-        self.dt = getattr(config, 'dt', 0.1)
-        self.max_v = getattr(config, 'max_v', 2.0)
-        self.max_omega = getattr(config, 'max_omega', 2.0)
-        self.max_a_v = getattr(config, 'max_a_v', 1.0)
-        self.max_a_omega = getattr(config, 'max_a_omega', 2.0)
-        self.damping_v = getattr(config, 'damping_v', 0.95)
-        self.damping_omega = getattr(config, 'damping_omega', 0.9)
-        self.mpc_iterations = getattr(config, 'mpc_iterations', 5)
-        self.mpc_lr = getattr(config, 'mpc_lr', 0.5)
-        self.mpc_Q = getattr(config, 'mpc_Q', [10.0, 10.0])
-        self.mpc_R = getattr(config, 'mpc_R', [0.1, 0.1])
-        self.mpc_Qf = getattr(config, 'mpc_Qf', [20.0, 20.0])
-        self.mpc_reachability_threshold = getattr(config, 'mpc_reachability_threshold', 0.8)
-    
-    def _build_hierarchy(self, lr: float) -> None:
+    def _build_hierarchy(self, config) -> None:
         """构建分层策略"""
         self.policies: List = []
         self.buffers: List[Optional[ReplayBuffer]] = []
         
         # Level 0: MPC 控制器
-        Q = torch.FloatTensor(self.mpc_Q)
-        R = torch.FloatTensor(self.mpc_R)
-        Qf = torch.FloatTensor(self.mpc_Qf)
-        
         self.mpc = MPCController(
-            state_dim=self.state_dim,
-            action_dim=self.action_dim,
-            goal_dim=self.goal_dim,
-            horizon=self.H,
-            dt=self.dt,
-            max_v=self.max_v,
-            max_omega=self.max_omega,
-            max_a_v=self.max_a_v,
-            max_a_omega=self.max_a_omega,
-            damping_v=self.damping_v,
-            damping_omega=self.damping_omega,
-            num_iterations=self.mpc_iterations,
-            lr=self.mpc_lr,
-            Q=Q, R=R, Qf=Qf,
+            horizon=config.mpc_horizon,
+            dt=config.dt,
+            max_v=config.max_v,
+            max_omega=config.max_omega,
+            max_a_v=config.max_a_v,
+            max_a_omega=config.max_a_omega,
+            damping_v=config.damping_v,
+            damping_omega=config.damping_omega,
         )
-        
         self.policies.append(self.mpc)
-        self.buffers.append(None)
+        self.buffers.append(None)  # MPC 不需要 buffer
         
-        # Level 1+: SAC
+        # Level 1+: SAC 策略
         for i in range(self.k_level - 1):
-            level = i + 1
-            encoder_mode = 'finetune' if level == 1 else 'rl'
-            
-            # 根据层级选择对应的 bounds
-            if level == 1:
-                action_bounds = self.subgoal_bounds_l1
-                action_offset = self.subgoal_offset_l1
-            else:
-                action_bounds = self.subgoal_bounds_l2
-                action_offset = self.subgoal_offset_l2
-            
             policy = SACAgent(
                 state_dim=self.state_dim,
-                action_dim=self.goal_dim,
+                action_dim=self.goal_dim,  # 输出子目标
                 goal_dim=self.goal_dim,
-                action_bounds=action_bounds,
-                action_offset=action_offset,
-                lr=lr,
+                action_bounds=self.subgoal_bounds,
+                action_offset=self.subgoal_offset,
+                lr=config.lr,
                 H=self.H,
-                hidden_dim=self.hidden_dim,
-                alpha=self.sac_alpha,
-                auto_entropy=self.sac_auto_entropy,
-                target_entropy=self.sac_target_entropy,
-                alpha_lr=self.sac_alpha_lr,
-                use_depth_encoder=self.use_depth_encoder,
-                base_state_dim=self.base_state_dim,
-                depth_dim=self.depth_dim,
-                embedding_dim=self.embedding_dim,
-                level=level,
-                encoder_train_mode=encoder_mode,
+                hidden_dim=config.hidden_dim,
+                alpha=config.sac_alpha,
+                auto_entropy=config.sac_auto_entropy,
             )
-            
             self.policies.append(policy)
             self.buffers.append(ReplayBuffer())
     
     def _print_summary(self) -> None:
         """打印初始化摘要"""
         print(f"HAC initialized:")
+        print(f"  Levels: {self.k_level}")
         print(f"  High-level (Level 1+): SAC")
-        print(f"  Low-level (Level 0): MPC (horizon={self.H})")
-        print(f"  Dynamics: damping_v={self.damping_v}, damping_omega={self.damping_omega}")
-        if self.level1_use_polar:
-            print(f"  Level 1 Safety: Depth constraint as post-processing")
-        if self.use_depth_encoder:
-            print(f"  Depth Encoder: {self.depth_dim}D → {self.embedding_dim}D")
-    
-    # ==================== 坐标转换 ====================
-    
-    def extract_goal_state(self, state: np.ndarray) -> np.ndarray:
-        """从状态提取目标相关部分"""
-        if self.goal_indices is not None:
-            return state[self.goal_indices]
-        return state
-    
-    def apply_depth_constraint(
-        self, 
-        state: np.ndarray, 
-        subgoal: np.ndarray
-    ) -> np.ndarray:
-        """
-        应用基于深度的安全约束
-        
-        Args:
-            state: 当前状态
-            subgoal: 世界坐标子目标 [x, y]
-            
-        Returns:
-            约束后的子目标 [x, y]
-        """
-        if not self.level1_use_polar:
-            return subgoal
-        
-        agent_pos = state[:2]
-        agent_theta = state[2]
-        
-        # 世界坐标 -> 极坐标
-        r, theta_rel = world_to_polar(agent_pos, agent_theta, subgoal)
-        
-        # 获取该方向及相邻方向的深度 (考虑机器人宽度)
-        # 取多个方向的最小深度，更保守
-        depth_center = self._get_depth_at_angle(state, theta_rel)
-        depth_left = self._get_depth_at_angle(state, theta_rel + 0.2)
-        depth_right = self._get_depth_at_angle(state, theta_rel - 0.2)
-        depth = min(depth_center, depth_left, depth_right)
-        
-        # 安全裕量需要考虑机器人半径 (agent_radius=0.2)
-        # 深度传感器从机器人中心测量，所以还需要额外减去机器人半径
-        agent_radius = getattr(self.config, 'agent_radius', 0.2)
-        effective_safety_margin = self.subgoal_safety_margin + agent_radius
-        r_max_depth = max(depth - effective_safety_margin, self.subgoal_r_min)
-        
-        # 边界约束
-        r_max_boundary = self._compute_boundary_r_max(agent_pos, agent_theta + theta_rel)
-        
-        # 应用约束
-        r_constrained = np.clip(
-            min(r, r_max_depth, r_max_boundary), 
-            self.subgoal_r_min, 
-            self.subgoal_r_max
-        )
-        
-        # 极坐标 -> 世界坐标
-        theta_world = agent_theta + theta_rel
-        dx = r_constrained * np.cos(theta_world)
-        dy = r_constrained * np.sin(theta_world)
-        
-        return agent_pos + np.array([dx, dy])
-    
-    def _get_depth_at_angle(self, state: np.ndarray, theta_rel: float) -> float:
-        """获取指定角度的深度读数 (插值)"""
-        depth_readings = state[self.base_state_dim:]
-        ray_angles = np.linspace(-self.depth_fov/2, self.depth_fov/2, self.depth_rays)
-        
-        theta_rel = np.arctan2(np.sin(theta_rel), np.cos(theta_rel))
-        
-        if theta_rel < ray_angles[0] or theta_rel > ray_angles[-1]:
-            return self.depth_max_range
-        
-        idx = np.searchsorted(ray_angles, theta_rel)
-        if idx == 0:
-            return depth_readings[0]
-        if idx >= self.depth_rays:
-            return depth_readings[-1]
-        
-        t = (theta_rel - ray_angles[idx-1]) / (ray_angles[idx] - ray_angles[idx-1])
-        return (1 - t) * depth_readings[idx-1] + t * depth_readings[idx]
-    
-    def _compute_boundary_r_max(
-        self, 
-        agent_pos: np.ndarray, 
-        theta_world: float
-    ) -> float:
-        """计算边界约束的最大距离"""
-        world_size = self.config.world_size
-        margin = self.boundary_margin
-        cos_t, sin_t = np.cos(theta_world), np.sin(theta_world)
-        r_max = float('inf')
-        
-        if cos_t > 1e-6:
-            r_max = min(r_max, (world_size - margin - agent_pos[0]) / cos_t)
-        elif cos_t < -1e-6:
-            r_max = min(r_max, (margin - agent_pos[0]) / cos_t)
-        
-        if sin_t > 1e-6:
-            r_max = min(r_max, (world_size - margin - agent_pos[1]) / sin_t)
-        elif sin_t < -1e-6:
-            r_max = min(r_max, (margin - agent_pos[1]) / sin_t)
-        
-        return max(r_max, self.subgoal_r_min)
-    
-    # ==================== 核心方法 ====================
+        print(f"  Low-level (Level 0): MPC (horizon={self.config.mpc_horizon})")
+        print(f"  State dim: {self.state_dim}, Goal dim: {self.goal_dim}")
     
     def check_goal(
         self, 
         state: np.ndarray, 
         goal: np.ndarray, 
-        threshold: np.ndarray
+        threshold: float
     ) -> bool:
         """检查是否达成目标"""
-        state_goal = self.extract_goal_state(state)
-        return np.all(np.abs(state_goal - goal) <= threshold)
+        pos = state[:2]  # [x, y]
+        return np.linalg.norm(pos - goal[:2]) <= threshold
     
-    def set_obstacles(self, obstacles: List[Tuple[float, float, float]]) -> None:
-        """设置障碍物 (特权学习)"""
-        self.privileged_obstacles = obstacles
-    
-    def repel_subgoal_from_obstacles(
-        self,
-        subgoal: np.ndarray,
-        agent_pos: np.ndarray,
-        safety_margin: float = 0.5
-    ) -> Tuple[np.ndarray, bool]:
-        """
-        基于 SGS-Planner 的球体膨胀思想，将子目标推离障碍物
-        
-        类似 SGS-Planner 的骨架提取：将点沿远离障碍物方向"推"到安全区域
-        
-        Args:
-            subgoal: 原始子目标 [x, y]
-            agent_pos: 机器人当前位置 [x, y]
-            safety_margin: 安全裕量
-            
-        Returns:
-            (推后的子目标, 是否发生了推移)
-        """
-        if not self.privileged_obstacles:
-            return subgoal, False
-        
-        repelled = subgoal.copy()
-        was_repelled = False
-        agent_radius = getattr(self.config, 'agent_radius', 0.2)
-        total_safe_dist = safety_margin + agent_radius
-        
-        # 迭代推离，最多 5 次（防止多个障碍物相互影响）
-        for _ in range(5):
-            repelled_this_iter = False
-            
-            for ox, oy, orad in self.privileged_obstacles:
-                obs_center = np.array([ox, oy])
-                to_subgoal = repelled - obs_center
-                dist = np.linalg.norm(to_subgoal)
-                
-                min_safe_dist = orad + total_safe_dist
-                
-                if dist < min_safe_dist:
-                    if dist < 1e-6:
-                        # 子目标正好在障碍物中心，用 agent->subgoal 方向
-                        direction = repelled - agent_pos
-                        if np.linalg.norm(direction) < 1e-6:
-                            # 极端情况：随机方向
-                            direction = np.array([1.0, 0.0])
-                        direction = direction / np.linalg.norm(direction)
-                    else:
-                        # 沿远离障碍物方向推
-                        direction = to_subgoal / dist
-                    
-                    # 推到安全距离外
-                    repelled = obs_center + direction * min_safe_dist
-                    was_repelled = True
-                    repelled_this_iter = True
-            
-            if not repelled_this_iter:
-                break
-        
-        # 边界约束
-        margin = self.boundary_margin
-        world_size = self.config.world_size
-        repelled = np.clip(repelled, margin, world_size - margin)
-        
-        return repelled, was_repelled
-    
-    def find_safest_direction(
-        self,
-        state: np.ndarray,
-        num_candidates: int = 8
-    ) -> Tuple[float, float]:
-        """
-        找到最安全的方向（最大间隙方向）
-        
-        类似 SGS-Planner 的骨架引导：找到远离所有障碍物的方向
-        
-        Args:
-            state: 当前状态
-            num_candidates: 候选方向数量
-            
-        Returns:
-            (最安全方向的角度, 该方向的深度)
-        """
-        depth_readings = state[self.base_state_dim:]
-        agent_theta = state[2]
-        
-        # 找最大深度对应的方向
-        ray_angles = np.linspace(-self.depth_fov/2, self.depth_fov/2, self.depth_rays)
-        max_idx = np.argmax(depth_readings)
-        max_depth = depth_readings[max_idx]
-        best_rel_angle = ray_angles[max_idx]
-        
-        return best_rel_angle, max_depth
-
     def run_HAC(
         self,
         env,
@@ -449,7 +135,7 @@ class HACAgent:
         is_subgoal_test: bool
     ) -> Tuple[np.ndarray, bool]:
         """
-        运行分层策略
+        运行分层策略 (训练模式)
         
         Args:
             env: 环境
@@ -465,23 +151,17 @@ class HACAgent:
         goal_transitions = []
         
         self.goals[level] = goal
-        self.goals_world[level] = goal[:2] if len(goal) >= 2 else goal
         
         for _ in range(self.H):
-            # 高层 (Level > 0): SAC
             if level > 0:
-                next_state, done, action = self._run_high_level(
+                # 高层: SAC 输出子目标
+                next_state, done, subgoal = self._run_high_level(
                     env, level, state, goal, is_subgoal_test, goal_transitions
                 )
-            # 底层 (Level 0): MPC
             else:
-                next_state, done, action = self._run_low_level(env, state, goal)
-            
-            # 存储转换 (仅高层)
-            if level > 0:
-                self._store_transition(
-                    level, state, action, next_state, goal, done, goal_transitions
-                )
+                # 底层: MPC 控制
+                next_state, done = self._run_low_level(env, state, goal)
+                subgoal = None
             
             state = next_state
             
@@ -506,118 +186,49 @@ class HACAgent:
         """运行高层策略"""
         policy = self.policies[level]
         
-        # 选择子目标
-        subgoal_original = policy.select_action(state, goal, deterministic=is_subgoal_test)
+        # 选择子目标 (世界坐标)
+        subgoal = policy.select_action(state, goal, deterministic=is_subgoal_test)
         
         # 边界裁剪
-        subgoal = np.clip(
-            subgoal_original,
-            [self.boundary_margin, self.boundary_margin],
-            [self.config.world_size - self.boundary_margin] * 2
+        margin = 0.1
+        subgoal = np.clip(subgoal, margin, self.world_size - margin)
+        
+        # 递归调用下一层
+        is_next_test = is_subgoal_test or np.random.random() < self.lamda
+        next_state, done = self.run_HAC(env, level - 1, state, subgoal, is_next_test)
+        
+        # 子目标测试: 如果未达成子目标，添加惩罚转换
+        if is_next_test and not self.check_goal(next_state, subgoal, self.threshold):
+            self.buffers[level].add((
+                state, subgoal, -self.H, next_state, goal, 0.0, float(done)
+            ))
+        
+        # 存储正常转换
+        self._store_transition(
+            level, state, subgoal, next_state, goal, done, goal_transitions
         )
         
-        # 保存深度约束前的子目标（用于 Hindsight Action）
-        subgoal_before_repel = subgoal.copy()
-        was_repelled = False
-        
-        # Level 1: 深度约束
-        if level == 1 and self.level1_use_polar:
-            subgoal = self.apply_depth_constraint(state, subgoal)
-        
-        # Level 1: 障碍物推子目标 (使用特权信息)
-        if level == 1 and self.privileged_obstacles:
-            agent_pos = state[:2]
-            subgoal, was_repelled = self.repel_subgoal_from_obstacles(
-                subgoal, agent_pos, safety_margin=self.subgoal_safety_margin
-            )
-            
-            # 如果子目标被推移，检查是否在正前方被阻挡 -> 寻找最安全方向
-            if was_repelled:
-                # 检查推后的子目标是否太近（说明正前方阻塞严重）
-                dist_to_subgoal = np.linalg.norm(subgoal - agent_pos)
-                if dist_to_subgoal < self.subgoal_r_min * 1.5:
-                    # 正前方严重阻塞，转向最安全方向
-                    best_angle, best_depth = self.find_safest_direction(state)
-                    agent_theta = state[2]
-                    
-                    # 在最安全方向上设置子目标
-                    safe_r = min(best_depth - self.subgoal_safety_margin, self.subgoal_r_max)
-                    safe_r = max(safe_r, self.subgoal_r_min)
-                    
-                    theta_world = agent_theta + best_angle
-                    subgoal = agent_pos + np.array([
-                        safe_r * np.cos(theta_world),
-                        safe_r * np.sin(theta_world)
-                    ])
-                    
-                    # 再次边界约束
-                    subgoal = np.clip(
-                        subgoal,
-                        [self.boundary_margin, self.boundary_margin],
-                        [self.config.world_size - self.boundary_margin] * 2
-                    )
-        
-        # Level 1: MPC 可达性预测
-        if level == 1:
-            is_reachable, _, pred_final = self.mpc.predict_reachability(
-                state, subgoal, self.mpc_reachability_threshold
-            )
-            
-            if not is_reachable:
-                # 不可达，惩罚并使用预测位置
-                self.buffers[level].add((
-                    state, subgoal, -self.H, state, goal, 0.0, 0.0
-                ))
-                next_state, done = self.run_HAC(env, 0, state, pred_final, False)
-            else:
-                next_state, done = self.run_HAC(env, 0, state, subgoal, False)
-                
-                if not self.check_goal(next_state, subgoal, self.threshold):
-                    self.buffers[level].add((
-                        state, subgoal, -self.H, next_state, goal, 0.0, float(done)
-                    ))
-            
-            # Hindsight Action 转换：如果子目标被推移，添加两个版本
-            if was_repelled:
-                self._add_hindsight_action_transitions(
-                    level, state, subgoal_before_repel, subgoal, 
-                    next_state, goal, done
-                )
-            
-            action = self.extract_goal_state(next_state)
-        
-        # Level 2+: 传统子目标测试
-        else:
-            is_next_test = is_subgoal_test or np.random.random() < self.lamda
-            next_state, done = self.run_HAC(env, level - 1, state, subgoal, is_next_test)
-            
-            if is_next_test and not self.check_goal(next_state, subgoal, self.threshold):
-                self.buffers[level].add((
-                    state, subgoal, -self.H, next_state, goal, 0.0, float(done)
-                ))
-            
-            action = self.extract_goal_state(next_state)
-        
-        return next_state, done, action
+        return next_state, done, subgoal
     
     def _run_low_level(
         self,
         env,
         state: np.ndarray,
         goal: np.ndarray
-    ) -> Tuple[np.ndarray, bool, np.ndarray]:
+    ) -> Tuple[np.ndarray, bool]:
         """运行底层 MPC"""
         action = self.mpc.select_action(state, goal)
         next_state, reward, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
         
-        if self.render and hasattr(env.unwrapped, 'render_subgoals'):
-            env.unwrapped.render_subgoals(self.goals_world)
+        # 渲染：显示所有层级的子目标
+        if self.render:
+            self._render_with_goals(env, next_state)
         
         self.reward += reward
         self.timestep += 1
         
-        return next_state, done, action
+        return next_state, done
     
     def _store_transition(
         self,
@@ -641,6 +252,7 @@ class HACAgent:
                 state, action, -1.0, next_state, goal, self.gamma, float(done)
             ))
         
+        # 保存用于 Hindsight
         goal_transitions.append([
             state, action, -1.0, next_state, None, self.gamma, float(done)
         ])
@@ -652,145 +264,14 @@ class HACAgent:
         goal_transitions: List
     ) -> None:
         """添加 Hindsight Goal 转换"""
-        hindsight_goal = self.extract_goal_state(final_state)
-        goal_transitions[-1][2] = 0.0
-        goal_transitions[-1][5] = 0.0
+        hindsight_goal = final_state[:2].copy()  # [x, y]
+        
+        goal_transitions[-1][2] = 0.0   # 最后一步 reward = 0
+        goal_transitions[-1][5] = 0.0   # gamma = 0
         
         for transition in goal_transitions:
             transition[4] = hindsight_goal
             self.buffers[level].add(tuple(transition))
-    
-    def _add_hindsight_action_transitions(
-        self,
-        level: int,
-        state: np.ndarray,
-        original_subgoal: np.ndarray,
-        repelled_subgoal: np.ndarray,
-        next_state: np.ndarray,
-        goal: np.ndarray,
-        done: bool
-    ) -> None:
-        """
-        添加 Hindsight Action 转换 (HAT)
-        
-        基于 SGS-Planner 的障碍物推子目标思想：
-        - 原始子目标可能不安全
-        - 推后的子目标更安全
-        - 两个版本都加入经验池，但推后的版本有更好的奖励信号
-        
-        Args:
-            level: 层级
-            state: 当前状态
-            original_subgoal: 原始子目标
-            repelled_subgoal: 推后的子目标
-            next_state: 下一状态
-            goal: 最终目标
-            done: 是否结束
-        """
-        if self.buffers[level] is None:
-            return
-        
-        # 检查推后的子目标是否真的不同
-        if np.allclose(original_subgoal, repelled_subgoal, atol=0.05):
-            return
-        
-        # 原始子目标 -> 可能不安全，给予较小的奖励
-        # (标准转换已在 _store_transition 中添加)
-        
-        # 推后的子目标 -> 更安全，作为 hindsight action
-        # 如果达到了推后的子目标，奖励为 0，否则为 -1
-        repelled_achieved = self.check_goal(next_state, repelled_subgoal, self.threshold)
-        
-        if repelled_achieved:
-            self.buffers[level].add((
-                state, repelled_subgoal, 0.0, next_state, goal, 0.0, float(done)
-            ))
-        else:
-            self.buffers[level].add((
-                state, repelled_subgoal, -1.0, next_state, goal, self.gamma, float(done)
-            ))
-    
-    # ==================== 训练方法 ====================
-    
-    def update(self, n_iter: int, batch_size: int) -> None:
-        """更新高层策略"""
-        for i in range(1, self.k_level):
-            if self.buffers[i] is not None and len(self.buffers[i]) > batch_size:
-                self.policies[i].update(self.buffers[i], n_iter, batch_size)
-    
-    def update_with_skeleton_guidance(
-        self, 
-        n_iter: int, 
-        batch_size: int,
-        skeleton_weight: float = 1.0,
-        safe_distance: float = 0.5
-    ) -> dict:
-        """
-        带骨架引导的策略更新
-        
-        基于 SGS-Planner 的思想：
-        - 骨架引导代价鼓励子目标远离障碍物
-        - 通过特权信息（障碍物位置）提供梯度
-        
-        Args:
-            n_iter: 迭代次数
-            batch_size: 批大小
-            skeleton_weight: 骨架引导损失权重
-            safe_distance: 安全距离
-            
-        Returns:
-            训练统计信息
-        """
-        stats = {}
-        
-        for i in range(1, self.k_level):
-            if self.buffers[i] is None or len(self.buffers[i]) <= batch_size:
-                continue
-            
-            # Level 1 使用带特权学习的更新
-            if i == 1 and self.privileged_obstacles:
-                level_stats = self.policies[i].update_with_privileged_loss(
-                    self.buffers[i], 
-                    n_iter, 
-                    batch_size,
-                    obstacles=self.privileged_obstacles,
-                    skeleton_weight=skeleton_weight,
-                    safe_distance=safe_distance
-                )
-                stats[f'level_{i}'] = level_stats
-            else:
-                # 其他层使用标准更新
-                self.policies[i].update(self.buffers[i], n_iter, batch_size)
-        
-        return stats
-    
-    def enable_level1_encoder_finetune(
-        self, 
-        finetune_lr: Optional[float] = None
-    ) -> None:
-        """启用 Level 1 编码器微调"""
-        if finetune_lr is None:
-            finetune_lr = self.encoder_finetune_lr
-        
-        if finetune_lr is None:
-            print("  Level 1 encoder: frozen")
-            self.policies[1].freeze_encoder()
-            return
-        
-        self.policies[1].setup_encoder_finetune(finetune_lr)
-        print(f"  Level 1 encoder: finetune enabled (lr={finetune_lr})")
-    
-    def reset_episode(self) -> None:
-        """重置 episode"""
-        self.reward = 0.0
-        self.timestep = 0
-        self.goals = [None] * self.k_level
-        self.goals_world = [None] * self.k_level
-        self.mpc.reset()
-    
-    def reset(self) -> None:
-        """重置智能体 (兼容推理接口)"""
-        self.reset_episode()
     
     def run_HAC_inference(
         self,
@@ -800,332 +281,101 @@ class HACAgent:
         goal: np.ndarray
     ) -> Tuple[np.ndarray, bool]:
         """
-        推理模式的 HAC 递归执行
+        推理模式的 HAC 执行
         
-        与训练版本的 run_HAC 类似，但：
-        - 不存储任何转换
-        - 使用确定性策略（不加噪声）
-        
-        官方实现参考: https://github.com/nikhilbarhate99/Hierarchical-Actor-Critic-HAC-PyTorch
-        
-        Args:
-            env: 环境
-            level: 当前层级
-            state: 当前状态
-            goal: 目标
-            
-        Returns:
-            (最终状态, 是否结束)
+        与训练模式的区别:
+        - 不存储转换
+        - 使用确定性策略
         """
         done = False
-        
         self.goals[level] = goal
-        self.goals_world[level] = goal[:2] if len(goal) >= 2 else goal
         
-        # H 次尝试
         for _ in range(self.H):
             if level > 0:
-                # 高层: SAC 策略输出子目标
+                # 高层: SAC
                 policy = self.policies[level]
                 subgoal = policy.select_action(state, goal, deterministic=True)
                 
                 # 边界裁剪
-                subgoal = np.clip(
-                    subgoal,
-                    [self.boundary_margin, self.boundary_margin],
-                    [self.config.world_size - self.boundary_margin] * 2
-                )
+                margin = 0.1
+                subgoal = np.clip(subgoal, margin, self.world_size - margin)
                 
-                # Level 1: 深度约束
-                if level == 1 and self.level1_use_polar:
-                    subgoal = self.apply_depth_constraint(state, subgoal)
-                
-                # Level 1: 障碍物推子目标 (使用特权信息)
-                if level == 1 and self.privileged_obstacles:
-                    agent_pos = state[:2]
-                    subgoal, was_repelled = self.repel_subgoal_from_obstacles(
-                        subgoal, agent_pos, safety_margin=self.subgoal_safety_margin
-                    )
-                    
-                    # 如果被推移且距离太近，转向最安全方向
-                    if was_repelled:
-                        dist_to_subgoal = np.linalg.norm(subgoal - agent_pos)
-                        if dist_to_subgoal < self.subgoal_r_min * 1.5:
-                            best_angle, best_depth = self.find_safest_direction(state)
-                            agent_theta = state[2]
-                            
-                            safe_r = min(best_depth - self.subgoal_safety_margin, self.subgoal_r_max)
-                            safe_r = max(safe_r, self.subgoal_r_min)
-                            
-                            theta_world = agent_theta + best_angle
-                            subgoal = agent_pos + np.array([
-                                safe_r * np.cos(theta_world),
-                                safe_r * np.sin(theta_world)
-                            ])
-                            
-                            subgoal = np.clip(
-                                subgoal,
-                                [self.boundary_margin, self.boundary_margin],
-                                [self.config.world_size - self.boundary_margin] * 2
-                            )
-                
-                # 递归调用下一层
+                # 递归
                 next_state, done = self.run_HAC_inference(env, level - 1, state, subgoal)
-                
             else:
-                # 底层: MPC 控制器
+                # 底层: MPC
                 action = self.mpc.select_action(state, goal)
                 next_state, reward, terminated, truncated, _ = env.step(action)
                 done = terminated or truncated
                 
-                # 渲染 (只调用一次，避免闪烁)
-                if self.render and hasattr(env.unwrapped, 'render_subgoals'):
-                    # render_subgoals 内部会绘制基础场景并 flip
-                    env.unwrapped.render_subgoals(self.goals_world)
-                elif self.render:
-                    # 没有子目标时，直接 render
-                    env.render()
+                # 渲染：显示所有层级的子目标
+                if self.render:
+                    self._render_with_goals(env, next_state)
                 
                 self.reward += reward
                 self.timestep += 1
             
             state = next_state
             
-            # 检查是否达成目标或结束
             if done or self.check_goal(next_state, goal, self.threshold):
                 break
         
         return next_state, done
     
-    def act(
-        self, 
-        state: np.ndarray, 
-        deterministic: bool = True
-    ) -> np.ndarray:
+    def _render_with_goals(self, env, state: np.ndarray) -> None:
         """
-        推理模式：返回单个动作（状态机实现）
-        
-        注意：这个方法是为了兼容标准的 RL 接口。
-        对于 HAC，更推荐使用 run_HAC_inference() 直接执行整个 episode。
+        渲染带有所有层级子目标的场景
         
         Args:
+            env: 环境
             state: 当前状态
-            deterministic: 是否使用确定性策略
-            
-        Returns:
-            action: 底层控制动作
         """
-        # 如果没有初始化尝试次数，初始化它
-        if not hasattr(self, '_attempts_remaining'):
-            self._attempts_remaining = [0] * self.k_level
+        # 收集所有层级的目标 (从底层到高层)
+        goals_to_render = []
+        for i in range(self.k_level):
+            if self.goals[i] is not None:
+                goals_to_render.append(self.goals[i])
+            else:
+                goals_to_render.append(None)
         
-        # 从最高层向下，检查每层是否需要生成新的子目标
-        for level in range(self.k_level - 1, 0, -1):
-            goal = self.goals[level]
-            if goal is None:
-                raise ValueError(f"Goal not set for level {level}. Call set_goal() first.")
-            
-            # 检查是否需要生成新的子目标
-            subgoal = self.goals[level - 1]
-            need_new_subgoal = (
-                subgoal is None or  # 第一次
-                self._attempts_remaining[level - 1] <= 0 or  # 下层用完尝试次数
-                self.check_goal(state, subgoal, self.threshold)  # 下层达成子目标
-            )
-            
-            if need_new_subgoal:
-                # 如果下层用完尝试或达成目标，当前层消耗一次尝试
-                if subgoal is not None:
-                    self._attempts_remaining[level] -= 1
-                
-                # 使用当前层策略生成新的子目标
-                policy = self.policies[level]
-                new_subgoal = policy.select_action(state, goal, deterministic=deterministic)
-                
-                # 边界裁剪
-                new_subgoal = np.clip(
-                    new_subgoal,
-                    [self.boundary_margin, self.boundary_margin],
-                    [self.config.world_size - self.boundary_margin] * 2
-                )
-                
-                # Level 1: 深度约束
-                if level == 1 and self.level1_use_polar:
-                    new_subgoal = self.apply_depth_constraint(state, new_subgoal)
-                
-                # Level 1: 障碍物推子目标 (使用特权信息)
-                if level == 1 and self.privileged_obstacles:
-                    agent_pos = state[:2]
-                    new_subgoal, was_repelled = self.repel_subgoal_from_obstacles(
-                        new_subgoal, agent_pos, safety_margin=self.subgoal_safety_margin
-                    )
-                    
-                    # 如果被推移且距离太近，转向最安全方向
-                    if was_repelled:
-                        dist_to_subgoal = np.linalg.norm(new_subgoal - agent_pos)
-                        if dist_to_subgoal < self.subgoal_r_min * 1.5:
-                            best_angle, best_depth = self.find_safest_direction(state)
-                            agent_theta = state[2]
-                            
-                            safe_r = min(best_depth - self.subgoal_safety_margin, self.subgoal_r_max)
-                            safe_r = max(safe_r, self.subgoal_r_min)
-                            
-                            theta_world = agent_theta + best_angle
-                            new_subgoal = agent_pos + np.array([
-                                safe_r * np.cos(theta_world),
-                                safe_r * np.sin(theta_world)
-                            ])
-                            
-                            new_subgoal = np.clip(
-                                new_subgoal,
-                                [self.boundary_margin, self.boundary_margin],
-                                [self.config.world_size - self.boundary_margin] * 2
-                            )
-                
-                # 设置下一层的目标
-                self.goals[level - 1] = new_subgoal
-                self.goals_world[level - 1] = new_subgoal[:2] if len(new_subgoal) >= 2 else new_subgoal
-                
-                # 重置下一层的尝试次数
-                self._attempts_remaining[level - 1] = self.H
+        # 调用环境的渲染方法
+        if hasattr(env, 'unwrapped'):
+            env.unwrapped.render_subgoals(goals_to_render)
+        else:
+            env.render_subgoals(goals_to_render)
         
-        # 底层 (Level 0): MPC 控制器执行原始动作
-        level0_goal = self.goals[0]
-        if level0_goal is None:
-            raise ValueError("Goal not set for level 0. This should not happen.")
-        
-        action = self.mpc.select_action(state, level0_goal)
-        
-        # 减少 Level 0 的尝试次数
-        self._attempts_remaining[0] -= 1
-        
-        return action
+        # 添加延时以便观察
+        time.sleep(0.03)
     
-    def set_goal(self, goal: np.ndarray) -> None:
-        """设置最终目标"""
-        self.goals[self.k_level - 1] = goal
-        self.goals_world[self.k_level - 1] = goal[:2] if len(goal) >= 2 else goal
-        # 初始化尝试次数
-        if not hasattr(self, '_attempts_remaining'):
-            self._attempts_remaining = [0] * self.k_level
-        self._attempts_remaining[self.k_level - 1] = self.H
+    def update(self, n_iter: int, batch_size: int) -> dict:
+        """更新所有高层策略"""
+        stats = {}
+        for i in range(1, self.k_level):
+            if self.buffers[i] is not None and len(self.buffers[i]) > batch_size:
+                level_stats = self.policies[i].update(self.buffers[i], n_iter, batch_size)
+                stats[f'level_{i}'] = level_stats
+        return stats
     
-    # ==================== 端到端训练 ====================
+    def reset_episode(self) -> None:
+        """重置 episode"""
+        self.reward = 0.0
+        self.timestep = 0
+        self.goals = [None] * self.k_level
+        self.mpc.reset()
     
-    def train_end_to_end_batch(
-        self,
-        states: np.ndarray,
-        final_goal: np.ndarray,
-        num_steps: int = 5,
-        lr: float = 3e-4,
-        verbose: bool = False
-    ) -> List[Dict]:
-        """
-        端到端训练 (特权学习)
-        
-        通过可微 MPC 更新高层策略。
-        """
-        if self.k_level < 2:
-            return [{'error': 'Need at least 2 levels'}]
-        
-        policy = self.policies[1]
-        if not hasattr(policy, 'actor'):
-            return [{'error': 'Policy has no actor'}]
-        
-        # 优化器
-        actor_params = [
-            p for n, p in policy.actor.named_parameters() 
-            if 'depth_encoder' not in n
-        ]
-        params = actor_params
-        if policy.depth_encoder is not None:
-            params = params + list(policy.depth_encoder.parameters())
-        optimizer = optim.Adam(params, lr=lr)
-        
-        batch_size = states.shape[0]
-        states_t = to_tensor(states)
-        goal_t = to_tensor(final_goal.reshape(1, -1)).expand(batch_size, -1)
-        
-        optimizer.zero_grad()
-        
-        # 多步展开
-        all_subgoals = []
-        all_trajectories = []
-        current_state = states_t.clone()
-        
-        for _ in range(num_steps):
-            subgoal, _ = policy.actor.sample(current_state, goal_t)
-            
-            # 边界约束
-            margin = self.boundary_margin
-            world_size = self.config.world_size
-            subgoal = torch.clamp(subgoal, margin, world_size - margin)
-            
-            # MPC 展开
-            action, trajectory, final_pos = self.mpc.mpc.get_action_with_gradient(
-                current_state, subgoal
-            )
-            
-            all_subgoals.append(subgoal)
-            all_trajectories.append(trajectory)
-            current_state = torch.cat([
-                trajectory[:, -1, :5],
-                states_t[:, 5:]
-            ], dim=1) if states_t.shape[1] > 5 else trajectory[:, -1, :5]
-        
-        # 损失计算
-        final_pos = all_trajectories[-1][:, -1, :2]
-        goal_loss = ((final_pos - goal_t) ** 2).sum(dim=1).mean()
-        
-        # 避障损失
-        obstacle_loss = self._compute_obstacle_loss(all_subgoals, all_trajectories)
-        
-        total_loss = goal_loss + 10.0 * obstacle_loss
-        total_loss.backward()
-        
-        torch.nn.utils.clip_grad_norm_(policy.actor.parameters(), max_norm=1.0)
-        optimizer.step()
-        
-        if verbose:
-            dist = torch.norm(final_pos - goal_t, dim=1).mean().item()
-            print(f"  E2E: dist={dist:.3f}, loss={total_loss.item():.3f}")
-        
-        return [{'total': torch.norm(final_pos - goal_t, dim=1).mean().item()}]
+    def reset(self) -> None:
+        """重置智能体"""
+        self.reset_episode()
     
-    def _compute_obstacle_loss(
-        self,
-        subgoals: List[torch.Tensor],
-        trajectories: List[torch.Tensor],
-        safe_dist: float = 0.3
-    ) -> torch.Tensor:
-        """计算避障损失"""
-        if not self.privileged_obstacles:
-            return torch.tensor(0.0, device=self._device)
-        
-        loss = torch.tensor(0.0, device=self._device)
-        
-        for sg in subgoals:
-            for ox, oy, r in self.privileged_obstacles:
-                center = torch.tensor([ox, oy], device=self._device)
-                dist = torch.norm(sg - center, dim=1)
-                violation = torch.clamp(r + safe_dist - dist, min=0)
-                loss = loss + (violation ** 2).mean()
-        
-        return loss
-    
-    # ==================== 保存/加载 ====================
-    
-    def save(self, directory: str, name: str, verbose: bool = True) -> None:
+    def save(self, directory: str, name: str) -> None:
         """保存模型"""
         os.makedirs(directory, exist_ok=True)
         for i in range(1, self.k_level):
             self.policies[i].save(directory, f'{name}_level_{i}')
-        if verbose:
-            print(f"  [SAVE] {directory}/{name}_level_*.pth")
+        print(f"  [SAVE] {directory}/{name}")
     
-    def load(self, directory: str, name: str, verbose: bool = True) -> None:
+    def load(self, directory: str, name: str) -> None:
         """加载模型"""
         for i in range(1, self.k_level):
             self.policies[i].load(directory, f'{name}_level_{i}')
-        if verbose:
-            print(f"  [LOAD] {directory}/{name}_level_*.pth")
+        print(f"  [LOAD] {directory}/{name}")

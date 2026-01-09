@@ -1,26 +1,19 @@
-"""可微模型预测控制器
+"""非可微 MPC 控制器
 
-通过梯度下降优化控制序列，支持:
-- 暖启动 (使用上一次的解作为初始值)
-- 早停 (代价变化小于阈值时提前退出)
-- 端到端训练 (梯度可回传到目标)
+简单的基于优化的 MPC 控制器，用于追踪子目标。
+不需要梯度传播，只负责底层控制。
 """
 
-import torch
-import torch.nn as nn
 import numpy as np
-from typing import Optional, Tuple, Dict, List
-
-from src.control.dynamics import DifferentiableDynamics
-from src.control.cost import MPCCost
-from src.utils.common import get_device
+from typing import Tuple
 
 
-class DifferentiableMPC(nn.Module):
+class MPCController:
     """
-    可微 MPC 控制器
+    MPC 控制器 (底层)
     
-    通过梯度下降优化控制序列。
+    接收高层提供的子目标 [x, y]，计算控制律 [a_v, a_ω]。
+    使用简单的梯度下降优化，不涉及神经网络。
     
     Args:
         horizon: 预测步长
@@ -33,8 +26,6 @@ class DifferentiableMPC(nn.Module):
         damping_omega: 角速度阻尼
         num_iterations: 优化迭代次数
         lr: 优化学习率
-        Q, R, Qf: 代价函数权重
-        early_stop_tol: 早停容差
     """
     
     def __init__(
@@ -49,292 +40,193 @@ class DifferentiableMPC(nn.Module):
         damping_omega: float = 0.9,
         num_iterations: int = 5,
         lr: float = 0.5,
-        Q: Optional[torch.Tensor] = None,
-        R: Optional[torch.Tensor] = None,
-        Qf: Optional[torch.Tensor] = None,
-        early_stop_tol: float = 1e-3,
     ):
-        super().__init__()
-        
         self.horizon = horizon
+        self.dt = dt
+        self.max_v = max_v
+        self.max_omega = max_omega
         self.max_a_v = max_a_v
         self.max_a_omega = max_a_omega
+        self.damping_v = damping_v
+        self.damping_omega = damping_omega
         self.num_iterations = num_iterations
         self.lr = lr
-        self.early_stop_tol = early_stop_tol
-        
-        # 动力学模型
-        self.dynamics = DifferentiableDynamics(
-            dt=dt, 
-            max_v=max_v, 
-            max_omega=max_omega,
-            damping_v=damping_v, 
-            damping_omega=damping_omega
-        )
-        
-        # 代价函数
-        self.cost_fn = MPCCost(Q=Q, R=R, Qf=Qf)
         
         # 暖启动缓存
-        self._prev_actions: Optional[torch.Tensor] = None
+        self._prev_actions = None
     
-    def _clip_actions(
+    def _dynamics_step(
         self, 
-        actions: torch.Tensor, 
-        soft: bool = False
-    ) -> torch.Tensor:
+        state: np.ndarray, 
+        action: np.ndarray
+    ) -> np.ndarray:
         """
-        裁剪动作到约束范围
+        单步动力学
         
-        Args:
-            actions: [batch, horizon, 2]
-            soft: 是否使用软裁剪
-            
-        Returns:
-            clipped: [batch, horizon, 2]
+        State: [x, y, θ, v, ω]
+        Action: [a_v, a_ω]
         """
-        a_v = actions[:, :, 0]
-        a_omega = actions[:, :, 1]
+        x, y, theta, v, omega = state[:5]
+        a_v, a_omega = action
         
-        if soft:
-            a_v = torch.tanh(a_v / self.max_a_v) * self.max_a_v
-            a_omega = torch.tanh(a_omega / self.max_a_omega) * self.max_a_omega
-        else:
-            a_v = torch.clamp(a_v, -self.max_a_v, self.max_a_v)
-            a_omega = torch.clamp(a_omega, -self.max_a_omega, self.max_a_omega)
-        
-        return torch.stack([a_v, a_omega], dim=2)
-    
-    def forward(
-        self,
-        state: torch.Tensor,
-        goal: torch.Tensor,
-        return_trajectory: bool = False
-    ) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
-        """
-        求解 MPC 并返回最优动作
-        
-        Args:
-            state: [batch, state_dim] 当前状态 (只用前5维)
-            goal: [batch, 2] 目标位置
-            return_trajectory: 是否返回预测轨迹
-            
-        Returns:
-            action: [batch, 2] 最优动作 (第一步)
-            cost: [batch] 总代价
-            info: dict
-        """
-        batch_size = state.shape[0]
-        device = state.device
-        
-        # 只使用前5维
-        base_state = state[:, :5].detach()
-        goal_detached = goal.detach()
-        
-        # 初始化控制序列
-        actions_data = torch.zeros(batch_size, self.horizon, 2, device=device)
-        
-        # 暖启动
-        if self._prev_actions is not None and self._prev_actions.shape[0] == batch_size:
-            actions_data = torch.cat([
-                self._prev_actions[:, 1:, :],
-                torch.zeros(batch_size, 1, 2, device=device)
-            ], dim=1).clone()
-        
-        # 优化迭代
-        prev_cost = float('inf')
-        for _ in range(self.num_iterations):
-            actions = actions_data.clone().requires_grad_(True)
-            
-            # 前向传播
-            clipped_actions = self._clip_actions(actions)
-            states = self.dynamics.rollout(base_state, clipped_actions)
-            
-            # 计算代价
-            cost = self.cost_fn(states, clipped_actions, goal_detached)
-            total_cost = cost.sum()
-            
-            # 早停检查
-            if abs(prev_cost - total_cost.item()) < self.early_stop_tol * batch_size:
-                break
-            prev_cost = total_cost.item()
-            
-            # 计算梯度并更新
-            total_cost.backward()
-            
-            with torch.no_grad():
-                actions_data = actions_data - self.lr * actions.grad
-                actions_data[:, :, 0].clamp_(-self.max_a_v, self.max_a_v)
-                actions_data[:, :, 1].clamp_(-self.max_a_omega, self.max_a_omega)
-        
-        # 最终解
-        final_actions = actions_data.detach()
-        with torch.no_grad():
-            final_states = self.dynamics.rollout(base_state, final_actions)
-            final_cost = self.cost_fn(final_states, final_actions, goal_detached)
-        
-        # 保存用于暖启动
-        self._prev_actions = final_actions.clone()
-        
-        info = {
-            'predicted_trajectory': final_states if return_trajectory else None,
-            'planned_actions': final_actions,
-            'cost': final_cost
-        }
-        
-        return final_actions[:, 0, :], final_cost, info
-    
-    def get_action_with_gradient(
-        self,
-        state: torch.Tensor,
-        goal: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        获取动作，同时保留对 goal 的梯度 (用于端到端训练)
-        
-        通过展开优化 (Unrolled Optimization) 实现可微。
-        
-        Args:
-            state: [batch, state_dim]
-            goal: [batch, 2] (需要梯度)
-            
-        Returns:
-            action: [batch, 2]
-            trajectory: [batch, horizon+1, 5]
-            final_position: [batch, 2] (有到 goal 的梯度)
-        """
-        batch_size = state.shape[0]
-        device = state.device
-        base_state = state[:, :5].detach()
-        
-        # 初始化动作序列
-        actions = torch.zeros(
-            batch_size, self.horizon, 2, 
-            device=device,
-            requires_grad=True
+        # 速度更新 (带阻尼)
+        v_new = np.clip(
+            self.damping_v * v + a_v * self.dt,
+            -self.max_v, self.max_v
+        )
+        omega_new = np.clip(
+            self.damping_omega * omega + a_omega * self.dt,
+            -self.max_omega, self.max_omega
         )
         
-        # 展开优化迭代 (保持计算图)
-        for _ in range(self.num_iterations):
-            clipped_actions = self._clip_actions(actions, soft=True)
-            states = self.dynamics.rollout(base_state, clipped_actions, soft_constraints=True)
-            cost = self.cost_fn(states, clipped_actions, goal)
+        # 位置更新
+        theta_new = theta + omega_new * self.dt
+        theta_new = np.arctan2(np.sin(theta_new), np.cos(theta_new))
+        x_new = x + v_new * np.cos(theta_new) * self.dt
+        y_new = y + v_new * np.sin(theta_new) * self.dt
+        
+        return np.array([x_new, y_new, theta_new, v_new, omega_new])
+    
+    def _rollout(
+        self, 
+        state: np.ndarray, 
+        actions: np.ndarray
+    ) -> np.ndarray:
+        """
+        轨迹展开
+        
+        Args:
+            state: [5] 初始状态
+            actions: [horizon, 2] 控制序列
             
-            # create_graph=True 保持二阶导数
-            grad = torch.autograd.grad(
-                cost.sum(), 
-                actions, 
-                create_graph=True,
-                retain_graph=True
-            )[0]
-            
-            actions = actions - self.lr * grad
+        Returns:
+            states: [horizon+1, 5] 状态轨迹
+        """
+        states = [state[:5].copy()]
+        current = state[:5].copy()
         
-        # 最终轨迹
-        final_actions = self._clip_actions(actions, soft=True)
-        final_states = self.dynamics.rollout(base_state, final_actions, soft_constraints=True)
+        for t in range(self.horizon):
+            current = self._dynamics_step(current, actions[t])
+            states.append(current)
         
-        return final_actions[:, 0, :], final_states, final_states[:, -1, :2]
+        return np.array(states)
     
-    def reset(self) -> None:
-        """重置暖启动缓存"""
-        self._prev_actions = None
-
-
-class MPCController:
-    """
-    MPC 控制器包装类
-    
-    提供与 RL 智能体相同的接口，用于 HAC 底层。
-    
-    Args:
-        state_dim: 状态维度
-        action_dim: 动作维度  
-        goal_dim: 目标维度
-        horizon: 预测步长
-        **kwargs: 其他 MPC 参数
-    """
-    
-    def __init__(
-        self,
-        state_dim: int,
-        action_dim: int,
-        goal_dim: int,
-        horizon: int = 10,
-        **kwargs
-    ):
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        self.goal_dim = goal_dim
+    def _compute_cost(
+        self, 
+        states: np.ndarray, 
+        actions: np.ndarray, 
+        goal: np.ndarray
+    ) -> float:
+        """
+        计算轨迹代价
         
-        device = get_device()
-        self.mpc = DifferentiableMPC(horizon=horizon, **kwargs).to(device)
-        self._device = device
+        J = Σ ||pos - goal||² + 0.1 * ||action||² + 10 * ||final_pos - goal||²
+        """
+        cost = 0.0
+        
+        # 阶段代价
+        for t in range(self.horizon):
+            pos = states[t, :2]
+            cost += np.sum((pos - goal) ** 2)
+            cost += 0.1 * np.sum(actions[t] ** 2)
+        
+        # 终端代价
+        final_pos = states[-1, :2]
+        cost += 10.0 * np.sum((final_pos - goal) ** 2)
+        
+        return cost
+    
+    def _compute_gradient(
+        self, 
+        state: np.ndarray, 
+        actions: np.ndarray, 
+        goal: np.ndarray,
+        eps: float = 1e-4
+    ) -> np.ndarray:
+        """
+        数值梯度计算
+        """
+        grad = np.zeros_like(actions)
+        base_cost = self._compute_cost(
+            self._rollout(state, actions), actions, goal
+        )
+        
+        for t in range(self.horizon):
+            for i in range(2):
+                actions_plus = actions.copy()
+                actions_plus[t, i] += eps
+                cost_plus = self._compute_cost(
+                    self._rollout(state, actions_plus), actions_plus, goal
+                )
+                grad[t, i] = (cost_plus - base_cost) / eps
+        
+        return grad
     
     def select_action(
         self, 
         state: np.ndarray, 
-        goal: np.ndarray, 
-        deterministic: bool = True
+        goal: np.ndarray
     ) -> np.ndarray:
         """
-        选择动作 (与 RL 智能体接口一致)
+        选择动作
         
         Args:
-            state: 状态
+            state: 当前状态 (可以包含深度，只用前5维)
             goal: 子目标 [x, y]
-            deterministic: MPC 本身是确定性的
             
         Returns:
             action: [a_v, a_ω]
         """
-        state_t = torch.FloatTensor(state.reshape(1, -1)).to(self._device)
-        goal_t = torch.FloatTensor(goal.reshape(1, -1)).to(self._device)
+        # 初始化动作序列
+        if self._prev_actions is not None:
+            actions = np.vstack([
+                self._prev_actions[1:],
+                np.zeros((1, 2))
+            ])
+        else:
+            actions = np.zeros((self.horizon, 2))
         
-        action, _, _ = self.mpc(state_t, goal_t)
-        return action.detach().cpu().numpy().flatten()
+        # 梯度下降优化
+        for _ in range(self.num_iterations):
+            grad = self._compute_gradient(state, actions, goal[:2])
+            actions = actions - self.lr * grad
+            
+            # 裁剪动作
+            actions[:, 0] = np.clip(actions[:, 0], -self.max_a_v, self.max_a_v)
+            actions[:, 1] = np.clip(actions[:, 1], -self.max_a_omega, self.max_a_omega)
+        
+        # 保存用于暖启动
+        self._prev_actions = actions.copy()
+        
+        return actions[0]
     
-    def predict_reachability(
-        self,
-        state: np.ndarray,
-        goal: np.ndarray,
-        threshold: float = 0.8
-    ) -> Tuple[bool, float, np.ndarray]:
+    def predict_final_position(
+        self, 
+        state: np.ndarray, 
+        goal: np.ndarray
+    ) -> np.ndarray:
         """
-        预测子目标可达性
+        预测 MPC 执行后的最终位置
         
         Args:
             state: 当前状态
-            goal: 子目标位置
-            threshold: 可达性阈值
+            goal: 子目标
             
         Returns:
-            is_reachable: 是否可达
-            distance: 预测最终距离
-            final_pos: 预测最终位置
+            final_pos: [x, y]
         """
-        state_t = torch.FloatTensor(state.reshape(1, -1)).to(self._device)
-        goal_t = torch.FloatTensor(goal[:2].reshape(1, -1)).to(self._device)
+        # 临时计算，不影响暖启动缓存
+        actions = np.zeros((self.horizon, 2))
         
-        _, _, info = self.mpc(state_t, goal_t, return_trajectory=True)
-        trajectory = info['predicted_trajectory']
-        final_pos = trajectory[0, -1, :2].detach().cpu().numpy()
+        for _ in range(self.num_iterations):
+            grad = self._compute_gradient(state, actions, goal[:2])
+            actions = actions - self.lr * grad
+            actions[:, 0] = np.clip(actions[:, 0], -self.max_a_v, self.max_a_v)
+            actions[:, 1] = np.clip(actions[:, 1], -self.max_a_omega, self.max_a_omega)
         
-        distance = np.linalg.norm(final_pos - goal[:2])
-        return distance <= threshold, distance, final_pos
-    
-    def update(self, buffer, n_iter: int, batch_size: int) -> None:
-        """MPC 不需要学习更新"""
-        pass
+        states = self._rollout(state, actions)
+        return states[-1, :2]
     
     def reset(self) -> None:
-        """重置 MPC 状态"""
-        self.mpc.reset()
-    
-    def save(self, directory: str, name: str) -> None:
-        """MPC 不需要保存参数"""
-        pass
-    
-    def load(self, directory: str, name: str) -> None:
-        """MPC 不需要加载参数"""
-        pass
+        """重置暖启动缓存"""
+        self._prev_actions = None
